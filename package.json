@@ -1,0 +1,17 @@
+{
+  "name": "aliexpress-deal-bot",
+  "version": "0.2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bot.js",
+    "login": "node login.js",
+    "test-link": "node test.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "telegram": "^2.26.22"
+  }
+}
