@@ -37,10 +37,24 @@ function extractSetId(title) {
   return m ? m[1] : null;
 }
 function toStars(p) {
-  const direct = num(p.avg_evaluation_rating) ?? num(p.evaluation_rating);
-  if (direct && direct <= 5) return direct.toFixed(1);
-  const rate = String(p.evaluate_rate || '').match(/([\d.]+)\s*%/);
-  if (rate) return (Number(rate[1]) / 20).toFixed(1);
+  // 5-scale rating fields
+  const direct =
+    num(p.avg_evaluation_rating) ??
+    num(p.evaluation_rating) ??
+    num(p.evaluation) ??
+    num(p.product_evaluation_rating) ??
+    num(p.avg_rating) ??
+    num(p.rating);
+  if (direct && direct > 0 && direct <= 5) return direct.toFixed(1);
+  // percentage-style fields (positive feedback) -> convert to 5-scale
+  const pctRaw =
+    p.evaluate_rate ??
+    p.product_evaluation_rate ??
+    p.positive_feedback_rate ??
+    p.evaluation_rate ??
+    '';
+  const rate = String(pctRaw).match(/([\d.]+)\s*%?/);
+  if (rate && Number(rate[1]) > 5) return (Number(rate[1]) / 20).toFixed(1);
   return null;
 }
 
@@ -75,6 +89,21 @@ function parseProduct(resp) {
   };
 }
 
+async function genShortLink(client, url, debug) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      const r = await client.generateLinks([url], { promotionLinkType: '2' });
+      if (debug) console.error('--- link.generate ---\n', JSON.stringify(r, null, 2));
+      const l = parseLink(r);
+      if (l) return l;
+    } catch (err) {
+      if (debug) console.error(`generate attempt ${i + 1} failed:`, err.message);
+    }
+    await new Promise((res) => setTimeout(res, 1500));
+  }
+  return null;
+}
+
 function parseLink(resp) {
   const result =
     dig(resp, 'aliexpress_affiliate_link_generate_response.resp_result.result') ||
@@ -98,13 +127,13 @@ export async function urlToMessage(input, { client = makeClient(), debug = false
   const product = parseProduct(detailResp);
   if (!product || !product.title) return { ok: false, reason: 'not_promotable', productId };
 
-  let link = product.promotionLink;
-  if (!link) {
-    const linkResp = await client.generateLinks([canonicalUrl]);
-    if (debug) console.error('--- link.generate ---\n', JSON.stringify(linkResp, null, 2));
-    link = parseLink(linkResp);
-  }
+  // Ask AliExpress for its SHORT link (type 2): native s.click/e/_ URL — no
+  // third party, no preview page. Retry so a transient rate-limit doesn't drop
+  // us to the long link.
+  let link = await genShortLink(client, canonicalUrl, debug);
+  if (!link) link = product.promotionLink; // last-resort fallback
   if (!link) return { ok: false, reason: 'no_link', productId, product };
+  if (link.length > 150) link = await shorten(link); // only fires on the fallback
 
   // AI-polish the Hebrew name + pull set id / pieces (no-op without a key)
   const p = await polish(product.title);
@@ -112,13 +141,11 @@ export async function urlToMessage(input, { client = makeClient(), debug = false
   if (p.setId) product.setId = p.setId;
   if (p.pieces) product.pieces = p.pieces;
 
-  const shortLink = await shorten(link);
-
   return {
     ok: true,
-    message: formatMessage(product, shortLink),
+    message: formatMessage(product, link),
     product,
-    link: shortLink,
+    link,
     productId,
     resolvedFrom,
   };
