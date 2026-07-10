@@ -1,6 +1,7 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
+import { ConnectionTCPObfuscated } from 'telegram/network/index.js';
 import { extractUrls } from './resolve.js';
 
 const CONNECT_TIMEOUT_MS = 20_000;
@@ -38,8 +39,16 @@ export async function startReader(onUrl) {
   const sources = sourceChannels();
   const backfillCount = Number(process.env.BACKFILL_COUNT ?? '30');
 
+  // TCPObfuscated instead of GramJS's Node default (plain TCPFull): some
+  // hosts/networks interfere with the unobfuscated MTProto framing specifically
+  // — symptom is exactly what we saw in production, the persistent keep-alive
+  // ping (updates.js's internal ~9s ping loop) timing out over and over while
+  // one-off requests like backfill's getMessages still went through fine.
+  // Wrapping the same bytes as generic-looking encrypted traffic routinely
+  // fixes that class of problem without needing anything changed on the VPS.
   const client = new TelegramClient(new StringSession(process.env.TG_SESSION), apiId, apiHash, {
     connectionRetries: 5,
+    connection: ConnectionTCPObfuscated,
   });
 
   console.log('   reader: connecting to Telegram (as your worker account)...');
