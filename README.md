@@ -44,6 +44,9 @@ Test the entire Telegram pipeline now, in MOCK mode, with just a bot token.
 ## Modes
 
 - `STAGING_CHAT_ID` set + `AUTO_APPROVE=false`: you approve/reject each deal (recommended).
+  Each staged deal also gets a ✏️ edit button — tap it, reply with corrected
+  title/text, and the card re-shows with your edit applied (image and
+  affiliate link untouched) for a fresh approve/reject.
 - `AUTO_APPROVE=true`: no tap, everything queues automatically.
 - `POST_INTERVAL_MINUTES`: how often one queued deal drips out.
 

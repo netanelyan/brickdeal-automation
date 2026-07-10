@@ -101,12 +101,38 @@ async function ingest(url, ctx, sourceText) {
     return 'queued';
   }
   const key = store.addStaging(cand);
-  const buttons = Markup.inlineKeyboard([
-    [Markup.button.callback('✅ אשר', `ok:${key}`), Markup.button.callback('❌ דחה', `no:${key}`)],
-    [Markup.button.callback('⏭️ דלג', `skip:${key}`)],
-  ]);
-  await deliver(staging, cand.message, cand.image, buttons);
+  await deliver(staging, cand.message, cand.image, stagingButtons(key));
   return 'staged';
+}
+
+function stagingButtons(key) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('✅ אשר', `ok:${key}`), Markup.button.callback('❌ דחה', `no:${key}`)],
+    [Markup.button.callback('✏️ ערוך', `edit:${key}`), Markup.button.callback('⏭️ דלג', `skip:${key}`)],
+  ]);
+}
+
+// Swap out only the headline (the card's first line, always `*title*` per
+// formatMessage) so price/pieces/link/image survive an edit untouched.
+function applyTitleEdit(message, newTitle) {
+  const cleaned = String(newTitle).replace(/\s+/g, ' ').trim();
+  const lines = message.split('\n');
+  lines[0] = `*${cleaned}*`;
+  return lines.join('\n');
+}
+
+// Re-render a staging card from outside a callback ctx (the edit reply
+// arrives as a plain message, not a button tap) — same Markdown-then-plain
+// fallback as deliver()/markDecided(), addressed by chatId+messageId instead.
+async function editCardRaw(chatId, messageId, isPhoto, text, extra = {}) {
+  const method = isPhoto ? 'editMessageCaption' : 'editMessageText';
+  try {
+    await bot.telegram[method](chatId, messageId, undefined, text, { parse_mode: 'Markdown', ...extra });
+  } catch {
+    await bot.telegram[method](chatId, messageId, undefined, text.replace(/[*_~`]/g, ''), extra).catch((e) =>
+      console.error('edit UX: card edit failed:', e.message)
+    );
+  }
 }
 
 // Rewrite the staging card in place so a decision is visible at a glance and
@@ -129,22 +155,26 @@ async function markDecided(ctx, statusLine, cand) {
 }
 
 bot.action(/^ok:(.+)$/, async (ctx) => {
-  const cand = store.takeStaging(ctx.match[1]);
+  const key = ctx.match[1];
+  const cand = store.takeStaging(key);
   if (!cand) {
     await ctx.answerCbQuery('כבר טופל');
     return;
   }
+  store.clearPendingEdit(key);
   store.enqueue(cand);
   const pos = store.queueSize();
   await ctx.answerCbQuery(`✅ אושר — ${pos} בתור`);
   await markDecided(ctx, `✅ אושר — ${pos} בתור`, cand);
 });
 bot.action(/^no:(.+)$/, async (ctx) => {
-  const cand = store.takeStaging(ctx.match[1]);
+  const key = ctx.match[1];
+  const cand = store.takeStaging(key);
   if (!cand) {
     await ctx.answerCbQuery('כבר טופל');
     return;
   }
+  store.clearPendingEdit(key);
   await ctx.answerCbQuery('❌ נדחה');
   await markDecided(ctx, '❌ נדחה', cand);
 });
@@ -154,8 +184,61 @@ bot.action(/^skip:(.+)$/, async (ctx) => {
   const pending = store.hasStaging(ctx.match[1]);
   await ctx.answerCbQuery(pending ? '⏭️ דולג — עדיין ממתין לאישור' : 'כבר טופל');
 });
+bot.action(/^edit:(.+)$/, async (ctx) => {
+  const key = ctx.match[1];
+  const cand = store.getStaging(key);
+  if (!cand) {
+    await ctx.answerCbQuery('כבר טופל');
+    return;
+  }
+  const chatId = ctx.chat.id;
+  const cardMessageId = ctx.callbackQuery.message.message_id;
+  const cardIsPhoto = Boolean(ctx.callbackQuery.message.photo);
+
+  await ctx.answerCbQuery('✏️ שלח את הטקסט המתוקן');
+  // Freeze the card mid-edit (no buttons) so it can't be approved/rejected
+  // against text that's about to change out from under it. The item itself
+  // stays in staging the whole time, so /pending and a backfill run are unaffected.
+  await markDecided(ctx, '✏️ ממתין לטקסט המתוקן שלך...', cand);
+
+  const prompt = await ctx.reply(
+    '✏️ שלח כותרת/טקסט מתוקן לעסקה שלמעלה (בתשובה להודעה הזו)',
+    { reply_parameters: { message_id: cardMessageId }, ...Markup.forceReply() }
+  );
+  // Keyed by the staged item itself (not by chat) — several deals can be
+  // mid-edit at once without one tap clobbering another's pending state.
+  store.setPendingEdit(key, { chatId, promptMessageId: prompt.message_id, cardMessageId, cardIsPhoto });
+});
+
+// Routes a reply to an edit prompt back to the deal it belongs to (matched by
+// the prompt's own message id, never by "whatever text came in next") —
+// applies the new title, restores the card's image/link/buttons, and stops
+// the message from also being tried as a URL submission.
+async function handleEditReply(ctx, key) {
+  const pending = store.getPendingEdit(key);
+  store.clearPendingEdit(key);
+  const cand = store.getStaging(key);
+  if (!pending || !cand) {
+    await ctx.reply('העסקה הזו כבר לא ממתינה לעריכה');
+    return;
+  }
+  const newTitle = (ctx.message.text || ctx.message.caption || '').trim();
+  if (!newTitle) {
+    await ctx.reply('שלח טקסט (לא תמונה/מדבקה)');
+    store.setPendingEdit(key, pending); // nothing consumed — leave the edit pending
+    return;
+  }
+  store.updateStagingMessage(key, applyTitleEdit(cand.message, newTitle));
+  const updated = store.getStaging(key);
+  await editCardRaw(pending.chatId, pending.cardMessageId, pending.cardIsPhoto, updated.message, stagingButtons(key));
+  await ctx.reply('✏️ עודכן — אשר/דחה למעלה');
+}
 
 bot.on('message', async (ctx, next) => {
+  const replyToId = ctx.message?.reply_to_message?.message_id;
+  const editKey = replyToId ? store.findPendingEditByPrompt(replyToId) : null;
+  if (editKey) return handleEditReply(ctx, editKey);
+
   const text = ctx.message?.text || ctx.message?.caption || '';
   const urls = extractUrls(text);
   if (!urls.length) return next?.();

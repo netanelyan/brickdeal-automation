@@ -11,7 +11,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // evaluated before .env has been loaded — see env.js/loadEnv().
 const ttlMs = () => Math.max(0, Number(process.env.SEEN_TTL_DAYS ?? '10')) * DAY_MS;
 
-const empty = { seen: {}, queue: [], staging: {} };
+const empty = { seen: {}, queue: [], staging: {}, pendingEdit: {} };
 let state = load();
 
 // Drop seen-entries older than the TTL, in place. Returns whether anything changed.
@@ -79,6 +79,15 @@ export function takeStaging(key) {
   save();
   return item || null;
 }
+// Look without removing — used while editing, where the item must stay in
+// staging (still counted by /pending, still guarded against double-decision).
+export const getStaging = (key) => state.staging[key] || null;
+export function updateStagingMessage(key, message) {
+  if (!state.staging[key]) return false;
+  state.staging[key] = { ...state.staging[key], message };
+  save();
+  return true;
+}
 export const hasStaging = (key) => Boolean(state.staging[key]);
 export const stagingSize = () => Object.keys(state.staging).length;
 // Discard everything still awaiting a decision (e.g. to reset after a big
@@ -86,8 +95,31 @@ export const stagingSize = () => Object.keys(state.staging).length;
 export function clearStaging() {
   const n = Object.keys(state.staging).length;
   state.staging = {};
+  state.pendingEdit = {};
   save();
   return n;
+}
+
+// --- pending edits (a staged item waiting on the operator's corrected text) ---
+// Keyed by the staging key itself (not by chat) so several deals can be
+// mid-edit at once without clobbering each other; routing an incoming reply
+// back to the right item is done by matching Telegram's reply_to_message id
+// against promptMessageId (see bot.js), never by "whatever came in last".
+export function setPendingEdit(key, { chatId, promptMessageId, cardMessageId, cardIsPhoto }) {
+  state.pendingEdit[key] = { chatId, promptMessageId, cardMessageId, cardIsPhoto };
+  save();
+}
+export const getPendingEdit = (key) => state.pendingEdit[key] || null;
+export function clearPendingEdit(key) {
+  delete state.pendingEdit[key];
+  save();
+}
+// Find the staging key whose edit prompt this incoming message is a reply to.
+export function findPendingEditByPrompt(promptMessageId) {
+  for (const [key, edit] of Object.entries(state.pendingEdit)) {
+    if (edit.promptMessageId === promptMessageId) return key;
+  }
+  return null;
 }
 
 // --- publish queue (approved, waiting to drip out) ---
