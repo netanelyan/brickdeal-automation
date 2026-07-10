@@ -5,18 +5,31 @@ import { Telegraf, Markup } from 'telegraf';
 import { extractUrls, resolveToProductId } from './src/resolve.js';
 import { toCandidate, hasAliKeys } from './src/candidate.js';
 import * as store from './src/store.js';
-import { readerConfigured, startReader } from './src/reader.js';
+import { readerConfigured, startReader, sourceChannels } from './src/reader.js';
+import * as notify from './src/notify.js';
 
 const {
   TG_BOT_TOKEN,
   CHANNEL_ID,
   STAGING_CHAT_ID,
+  OWNER_ID,
   POST_INTERVAL_MINUTES = '180',
   AUTO_APPROVE = 'false',
+  HEARTBEAT_HOURS = '6',
+  SKIP_DIGEST_HOURS = '3',
+  QUALITY_SKIP_NOTIFY = 'digest', // off | each | digest
+  QUIET_ALERT_HOURS = '3',
 } = process.env;
 
 if (!TG_BOT_TOKEN || !CHANNEL_ID) {
   console.error('Set TG_BOT_TOKEN and CHANNEL_ID in .env');
+  process.exit(1);
+}
+// Fail closed, not open: without a known owner id there's no one left to
+// lock the bot to, so refuse to start rather than quietly accepting DMs
+// from anyone who finds the username.
+if (!OWNER_ID) {
+  console.error('Set OWNER_ID in .env (your Telegram user id) so the bot only responds to you.');
   process.exit(1);
 }
 
@@ -24,6 +37,27 @@ const bot = new Telegraf(TG_BOT_TOKEN);
 const staging = STAGING_CHAT_ID || null;
 const autoApprove = AUTO_APPROVE === 'true';
 const intervalMs = Math.max(1, Number(POST_INTERVAL_MINUTES)) * 60_000;
+
+// String comparison sidesteps any float-precision edge case with large
+// Telegram user ids — safer than coercing both sides to Number.
+const isOwner = (ctx) => String(ctx.from?.id) === String(OWNER_ID);
+
+// Registered before any other handler, so nothing below it — messages,
+// forwards, /commands, or button taps — ever runs for anyone but the owner.
+// Only covers this Telegraf bot; the GramJS reader (src/reader.js) ingests
+// straight from source channels via its own client and never passes through
+// here, so it's untouched by this gate.
+bot.use(async (ctx, next) => {
+  if (isOwner(ctx)) return next();
+  console.log(`blocked non-owner update from ${ctx.from?.id ?? 'unknown'} (${ctx.from?.username || 'no username'})`);
+  if (ctx.callbackQuery) {
+    // Also clears Telegram's loading spinner on the tapped button — a bare
+    // `return` without answering would leave it spinning on their end.
+    await ctx.answerCbQuery('⛔ not authorized').catch(() => {});
+    return;
+  }
+  await ctx.reply('⛔ not authorized').catch(() => {});
+});
 
 const CAPTION_MAX = 1000;
 
@@ -65,12 +99,14 @@ function lowQualityReason(cand) {
 // watched source channel — it's undefined for manual forwards, which keeps
 // working exactly as before.
 async function ingest(url, ctx, sourceText) {
+  stats.seen++;
   // Claim the product ID up front (before the slow AliExpress calls) so two
   // source channels posting the same deal seconds apart can't both slip past
   // the hasSeen check and get staged twice.
   const { productId: preId } = await resolveToProductId(url);
   if (preId) {
     if (store.hasSeen(preId)) {
+      stats.skippedDedup++;
       if (ctx) ctx.reply('already posted this one');
       return 'duplicate';
     }
@@ -87,20 +123,25 @@ async function ingest(url, ctx, sourceText) {
   if (reason) {
     if (preId) store.forgetSeen(preId); // a future post of the same product may carry better info
     console.log(`ingest: skipped low-quality deal ${cand.productId} — ${reason}`);
+    stats.skippedQuality++;
+    await notifyQualitySkip(cand, reason);
     if (ctx) ctx.reply(`skipped (low quality): ${reason}`);
     return 'skipped';
   }
   if (!preId && store.hasSeen(cand.productId)) {
+    stats.skippedDedup++;
     if (ctx) ctx.reply('already posted this one');
     return 'duplicate';
   }
   if (!preId) store.markSeen(cand.productId);
   if (autoApprove || !staging) {
     store.enqueue(cand);
+    stats.staged++;
     if (ctx) ctx.reply(`queued (position ${store.queueSize()})`);
     return 'queued';
   }
   const key = store.addStaging(cand);
+  stats.staged++;
   await deliver(staging, cand.message, cand.image, stagingButtons(key));
   return 'staged';
 }
@@ -264,6 +305,114 @@ async function publishNext() {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Monitoring: startup ping, periodic heartbeat, quality-skip visibility, a
+// quiet-reader alert, and reader drop/reconnect. Everything here DMs
+// STAGING_CHAT_ID in Hebrew via src/notify.js. All in-memory — a restart just
+// starts a fresh counting window, which is fine for a status report.
+// ---------------------------------------------------------------------------
+
+let stats = { seen: 0, staged: 0, skippedQuality: 0, skippedDedup: 0 };
+let qualitySkipQueue = []; // [{ cand, reason }] — drained by the digest timer
+
+async function notifyQualitySkip(cand, reason) {
+  if (QUALITY_SKIP_NOTIFY === 'each') {
+    await notify.send(bot.telegram, staging, notify.qualitySkipSingle(cand, reason));
+  } else if (QUALITY_SKIP_NOTIFY === 'digest') {
+    qualitySkipQueue.push({ cand, reason });
+  }
+  // 'off' — filter still runs (bot.js console.log above still fires), just no DM.
+}
+
+function sendHeartbeat() {
+  if (!readerHealthy) return; // spec: only report while the reader is actually up
+  const text = notify.heartbeat({ ...stats, queueSize: store.queueSize(), readerOn: readerHealthy });
+  stats = { seen: 0, staged: 0, skippedQuality: 0, skippedDedup: 0 };
+  return notify.send(bot.telegram, staging, text);
+}
+
+function sendQualityDigest() {
+  if (QUALITY_SKIP_NOTIFY !== 'digest' || !qualitySkipQueue.length) return; // nothing to say, stay quiet
+  const items = qualitySkipQueue;
+  qualitySkipQueue = [];
+  return notify.send(bot.telegram, staging, notify.qualitySkipDigest(items, SKIP_DIGEST_HOURS));
+}
+
+// --- reader supervision ---
+let readerClient = null;
+let readerHealthy = false;
+let reconnecting = false;
+let reconnectFails = 0;
+let outageAlerted = false; // "reader is down" DM sent for the *current* outage
+let outageStillDownAlerted = false; // "still down after N tries" DM sent for the current outage
+let lastReaderIngestAt = null;
+let quietAlertSent = false; // one quiet-alert per quiet period, not one per check
+
+const RECONNECT_DELAYS_MS = [30_000, 60_000, 120_000, 240_000, 300_000]; // holds at 5 min
+const RECONNECT_ALERT_THRESHOLD = 5;
+
+// Every URL the reader hands us marks it "alive" for the quiet-alert check —
+// deliberately separate from ingest()'s own stats, which also count manual
+// DM forwards and shouldn't reset the reader-specific silence timer.
+function onReaderUrl(url, sourceText) {
+  lastReaderIngestAt = Date.now();
+  quietAlertSent = false;
+  return ingest(url, undefined, sourceText);
+}
+
+// The one path for "(re)establish the reader connection" — used for the
+// initial connect failing AND for a later drop. Re-running startReader() in
+// full (including its backfill) rather than trying to resume the half-dead
+// GramJS client is deliberate: ingest()'s dedupe already makes re-seeing
+// recent messages a no-op, so a full reconnect is simple *and* safe, instead
+// of hand-rolling a resume path against undocumented client internals.
+async function reconnectReader() {
+  if (reconnecting) return;
+  reconnecting = true;
+  await readerClient?.disconnect().catch(() => {});
+  try {
+    readerClient = await startReader(onReaderUrl);
+    readerHealthy = true;
+    if (outageAlerted) await notify.send(bot.telegram, staging, notify.readerReconnected());
+    reconnectFails = 0;
+    outageAlerted = false;
+    outageStillDownAlerted = false;
+  } catch (e) {
+    readerHealthy = false;
+    reconnectFails++;
+    console.error(`   reader: reconnect attempt ${reconnectFails} failed — ${e.message}`);
+    if (!outageAlerted) {
+      outageAlerted = true;
+      await notify.send(bot.telegram, staging, notify.readerNotConnected());
+    }
+    if (reconnectFails >= RECONNECT_ALERT_THRESHOLD && !outageStillDownAlerted) {
+      outageStillDownAlerted = true;
+      await notify.send(bot.telegram, staging, notify.readerStillDown(reconnectFails));
+    }
+    const delay = RECONNECT_DELAYS_MS[Math.min(reconnectFails - 1, RECONNECT_DELAYS_MS.length - 1)];
+    setTimeout(reconnectReader, delay);
+  } finally {
+    reconnecting = false;
+  }
+}
+
+// Runs every minute: notices a dropped GramJS connection (`client.disconnected`
+// is a plain property GramJS exposes — no event to subscribe to) and kicks
+// off reconnectReader(), and separately checks the quiet-reader alert.
+function monitorTick() {
+  if (readerHealthy && readerClient?.disconnected) {
+    readerHealthy = false;
+    reconnectReader();
+  }
+  if (readerHealthy && lastReaderIngestAt) {
+    const quietHours = (Date.now() - lastReaderIngestAt) / 3_600_000;
+    if (quietHours > Math.max(1, Number(QUIET_ALERT_HOURS)) && !quietAlertSent) {
+      quietAlertSent = true;
+      notify.send(bot.telegram, staging, notify.quietAlert(Math.floor(quietHours))).catch(() => {});
+    }
+  }
+}
+
 async function main() {
   console.log('starting bot...');
 
@@ -284,25 +433,54 @@ async function main() {
   console.log(`bot live (@${me.username})`);
   console.log(`   mode: ${hasAliKeys() ? 'LIVE (real links)' : 'MOCK (no AliExpress keys)'}`);
   console.log(`   approval: ${autoApprove || !staging ? 'OFF (auto-queue)' : 'ON (tap to approve)'}`);
+  console.log(`   owner lock: ON (only ${OWNER_ID} can use this bot)`);
   console.log(`   drip: 1 deal every ${POST_INTERVAL_MINUTES} min`);
 
   setInterval(() => {
     publishNext().catch((e) => console.error('publish error:', e.message));
   }, intervalMs);
 
+  // bot.launch() and the drip interval above are already running and don't
+  // wait on any of this — only the startup ping (which needs to know the
+  // reader's real status) and the monitoring timers are sequenced after it.
+  // reader.js bounds its own connect/auth calls with timeouts, so this can't
+  // hang forever; a failed connect here just hands off to reconnectReader().
   if (readerConfigured()) {
     console.log('   reader: connecting...');
-    // Never let a stuck/failed reader block the rest of the bot — manual
-    // forwarding must keep working even if the userbot can't connect.
-    startReader((url, sourceText) => ingest(url, undefined, sourceText))
-      .then(() => console.log('   reader: ON'))
-      .catch((e) => {
-        console.error(`   reader: FAILED — ${e.message}`);
-        console.error('   bot continues without it; forward links to the bot manually.');
-      });
+    try {
+      readerClient = await startReader(onReaderUrl);
+      readerHealthy = true;
+      console.log('   reader: ON');
+    } catch (e) {
+      console.error(`   reader: FAILED — ${e.message}`);
+      console.error('   bot continues without it; retrying in the background.');
+      readerHealthy = false;
+    }
   } else {
     console.log('   reader: OFF (forward links to the bot)');
   }
+
+  await notify.send(
+    bot.telegram,
+    staging,
+    notify.startupPing({ readerOn: readerHealthy, queueSize: store.queueSize(), channelCount: sourceChannels().length })
+  );
+
+  setInterval(monitorTick, 60_000);
+  setInterval(() => {
+    sendHeartbeat()?.catch?.((e) => console.error('heartbeat error:', e.message));
+  }, Math.max(1, Number(HEARTBEAT_HOURS)) * 3_600_000);
+  if (QUALITY_SKIP_NOTIFY === 'digest') {
+    setInterval(() => {
+      sendQualityDigest()?.catch?.((e) => console.error('quality digest error:', e.message));
+    }, Math.max(1, Number(SKIP_DIGEST_HOURS)) * 3_600_000);
+  }
+  if (readerConfigured() && !readerHealthy) {
+    reconnectReader(); // initial connect failed above — start the backoff loop
+  }
+  console.log(
+    `   monitoring: heartbeat every ${HEARTBEAT_HOURS}h · quality-skip notify: ${QUALITY_SKIP_NOTIFY} · quiet alert after ${QUIET_ALERT_HOURS}h`
+  );
 }
 
 main().catch((e) => {

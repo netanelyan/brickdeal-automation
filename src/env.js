@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs';
 
+// Hand-rolled on purpose — the whole thing is ~10 lines, not worth pulling in
+// the `dotenv` package just for this.
 export function loadEnv() {
   try {
     const env = readFileSync(new URL('../.env', import.meta.url), 'utf8');

@@ -4,8 +4,13 @@
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
 
+// Standard product page: aliexpress.com/item/[slug_]1005012345678.html
 const ITEM_RE = /\/item\/(?:[^/]*?_)?(\d{6,})\.html/i;
+// Some app/share links carry the id as a query param instead of in the path.
 const QUERY_ID_RE = /[?&](?:productId|product_id|itemId)=(\d{6,})/i;
+// Some s.click short links land on a JS interstitial with no real URL — the
+// id still shows up embedded in the page's own script/markup, so this scans
+// raw HTML/JS text for the same shapes as ITEM_RE, plus a bare productId key.
 const BODY_RE = /(?:\/item\/(?:[^/"']*?_)?|productId["':=\s]+)(\d{6,})/i;
 
 const canonical = (id) => `https://www.aliexpress.com/item/${id}.html`;

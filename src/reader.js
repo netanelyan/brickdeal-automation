@@ -9,6 +9,14 @@ const BACKFILL_DELAY_MS = 1200; // throttle so we don't hammer AliExpress/Telegr
 export const readerConfigured = () =>
   Boolean(process.env.TG_API_ID && process.env.TG_API_HASH && process.env.TG_SESSION);
 
+// Shared with bot.js (startup ping / heartbeat channel count) so there's one
+// place that parses SOURCE_CHANNELS instead of two copies drifting apart.
+export const sourceChannels = () =>
+  (process.env.SOURCE_CHANNELS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -27,10 +35,7 @@ function withTimeout(promise, ms, label) {
 export async function startReader(onUrl) {
   const apiId = Number(process.env.TG_API_ID);
   const apiHash = process.env.TG_API_HASH;
-  const sources = (process.env.SOURCE_CHANNELS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const sources = sourceChannels();
   const backfillCount = Number(process.env.BACKFILL_COUNT ?? '30');
 
   const client = new TelegramClient(new StringSession(process.env.TG_SESSION), apiId, apiHash, {

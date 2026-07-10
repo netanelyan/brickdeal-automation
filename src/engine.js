@@ -25,10 +25,17 @@ function pickImage(p) {
     p.image_url ||
     null;
   if (!c) return null;
+  // AliExpress image URLs sometimes trail off into resize/tracking params
+  // after the real extension — trim to the base file so Telegram gets a
+  // clean, direct image URL instead of whatever was tacked on after it.
   const m = String(c).match(/^(https?:\/\/[^\s]+?\.(?:jpg|jpeg|png|webp))/i);
   return m ? m[1] : String(c);
 }
 
+// AliExpress's API has no structured "LEGO set number" or "piece count"
+// field — these are just best-effort scrapes of whatever the seller wrote
+// in the title. src/sourceText.js covers the same ground for the channel
+// message text, used as a second fallback when this comes up empty.
 function extractPieces(title) {
   const m = String(title).match(/(\d[\d,]{1,6})\s*(?:pcs|pieces|piece|חלקים)/i);
   return m ? m[1].replace(/,/g, '') : null;
