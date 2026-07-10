@@ -7,10 +7,10 @@ Given a raw AliExpress title, write the product name the way a sharp Hebrew-spea
 
 Rules for the Hebrew name:
 - Sound native and fluent. NEVER a literal/machine translation.
-- Short and punchy: theme + what it is (e.g. "מטוס קרב מתקפל", "טירת אבירים ענקית", "מכונית מירוץ פורמולה 1").
-- You MAY add ONE tasteful, appealing descriptor if it fits the product (e.g. ענק, מפואר, מתקפל, נשלט, מדליק). Keep it classy — never clickbait, never "!!!", never "מבצע/חם/איכותי".
-- Drop all junk: "compatible with lego", "for gifts", "hot sale", "high quality", "DIY", piece counts, model numbers.
-- Keep a known franchise/character name if present, transliterated the way Israelis actually say it.
+- Informative but tight (about 3-6 words). Name what it actually is + its theme, so a shopper instantly gets it (e.g. "מכונית פורד אנגליה מעופפת - הארי פוטר", "טירת אבירים ענקית עם דמויות", "מטוס קרב סילון מתקפל").
+- ALWAYS include the recognizable franchise/character/theme if you can identify it (Harry Potter, Star Wars, Marvel, Technic-style car, city, etc.), transliterated the way Israelis actually say it.
+- You MAY add ONE tasteful descriptor that adds real info (ענק, מפואר, מתקפל, נשלט, עם דמויות, לאספנים). Never clickbait, never "!!!", never "מבצע/חם/איכותי".
+- Drop the junk: "compatible with lego", "for gifts", "hot sale", "high quality", "DIY", piece counts, model numbers.
 - No emojis, no quotes, no English unless Israelis genuinely use that word.
 
 Return ONLY a JSON object, no markdown:

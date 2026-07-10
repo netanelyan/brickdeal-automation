@@ -3,6 +3,7 @@ import { resolveToProductId } from './resolve.js';
 import { formatMessage } from './format.js';
 import { polish } from './polish.js';
 import { shorten } from './shorten.js';
+import { extractSetIdFromText, extractPiecesFromText } from './sourceText.js';
 
 export function makeClient(env = process.env) {
   return new AliClient({
@@ -113,7 +114,7 @@ function parseLink(resp) {
   return first?.promotion_link || null;
 }
 
-export async function urlToMessage(input, { client = makeClient(), debug = false } = {}) {
+export async function urlToMessage(input, { client = makeClient(), debug = false, sourceText = '' } = {}) {
   const { productId, canonicalUrl, resolvedFrom } = await resolveToProductId(input);
   if (!productId) return { ok: false, reason: 'no_product_id', input };
 
@@ -140,6 +141,18 @@ export async function urlToMessage(input, { client = makeClient(), debug = false
   if (p.title) product.title = p.title;
   if (p.setId) product.setId = p.setId;
   if (p.pieces) product.pieces = p.pieces;
+
+  // Source channels often post the official set number / piece count right
+  // in the message text — fall back to that when the AliExpress title didn't
+  // give us one (manual forwards have no sourceText, so this is a no-op then).
+  if (!product.setId) {
+    const setId = extractSetIdFromText(sourceText);
+    if (setId) product.setId = setId;
+  }
+  if (!product.pieces) {
+    const pieces = extractPiecesFromText(sourceText);
+    if (pieces) product.pieces = pieces;
+  }
 
   return {
     ok: true,

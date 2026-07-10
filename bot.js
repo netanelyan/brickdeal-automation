@@ -2,7 +2,7 @@ import { loadEnv } from './src/env.js';
 loadEnv();
 
 import { Telegraf, Markup } from 'telegraf';
-import { extractUrls } from './src/resolve.js';
+import { extractUrls, resolveToProductId } from './src/resolve.js';
 import { toCandidate, hasAliKeys } from './src/candidate.js';
 import * as store from './src/store.js';
 import { readerConfigured, startReader } from './src/reader.js';
@@ -47,43 +47,112 @@ async function deliver(chatId, text, image, extra = {}) {
   }
 }
 
-async function ingest(url, ctx) {
-  const cand = await toCandidate(url);
+// With AUTO_APPROVE on, nothing gets a human look before it's posted — this
+// is the only thing standing between a junk listing and the channel. Stays
+// conservative on purpose: only drops candidates with literally nothing to
+// show (no set number, no piece count, no rating) or no product image.
+// Skipped for mock candidates, which never carry a real image.
+function lowQualityReason(cand) {
+  if (cand.mock) return null;
+  if (!cand.image) return 'no product image';
+  if (!cand.setId && !cand.pieces && !cand.stars) return 'no set number, piece count, or rating';
+  return null;
+}
+
+// Returns a status string so callers (reader backfill in particular) can
+// tally outcomes: 'duplicate' | 'failed' | 'queued' | 'staged' | 'skipped'.
+// sourceText is the surrounding message text when the URL came from a
+// watched source channel — it's undefined for manual forwards, which keeps
+// working exactly as before.
+async function ingest(url, ctx, sourceText) {
+  // Claim the product ID up front (before the slow AliExpress calls) so two
+  // source channels posting the same deal seconds apart can't both slip past
+  // the hasSeen check and get staged twice.
+  const { productId: preId } = await resolveToProductId(url);
+  if (preId) {
+    if (store.hasSeen(preId)) {
+      if (ctx) ctx.reply('already posted this one');
+      return 'duplicate';
+    }
+    store.markSeen(preId);
+  }
+
+  const cand = await toCandidate(url, sourceText);
   if (!cand.ok) {
+    if (preId) store.forgetSeen(preId); // build failed — don't permanently block a retry
     if (ctx) ctx.reply(`skipped: ${cand.reason}`);
-    return;
+    return 'failed';
   }
-  if (store.hasSeen(cand.productId)) {
+  const reason = lowQualityReason(cand);
+  if (reason) {
+    if (preId) store.forgetSeen(preId); // a future post of the same product may carry better info
+    console.log(`ingest: skipped low-quality deal ${cand.productId} — ${reason}`);
+    if (ctx) ctx.reply(`skipped (low quality): ${reason}`);
+    return 'skipped';
+  }
+  if (!preId && store.hasSeen(cand.productId)) {
     if (ctx) ctx.reply('already posted this one');
-    return;
+    return 'duplicate';
   }
+  if (!preId) store.markSeen(cand.productId);
   if (autoApprove || !staging) {
     store.enqueue(cand);
     if (ctx) ctx.reply(`queued (position ${store.queueSize()})`);
-    return;
+    return 'queued';
   }
   const key = store.addStaging(cand);
   const buttons = Markup.inlineKeyboard([
-    Markup.button.callback('approve', `ok:${key}`),
-    Markup.button.callback('reject', `no:${key}`),
+    [Markup.button.callback('✅ אשר', `ok:${key}`), Markup.button.callback('❌ דחה', `no:${key}`)],
+    [Markup.button.callback('⏭️ דלג', `skip:${key}`)],
   ]);
-  const preview = cand.message + '\n\n— approve to queue —';
-  await deliver(staging, preview, cand.image, buttons);
+  await deliver(staging, cand.message, cand.image, buttons);
+  return 'staged';
+}
+
+// Rewrite the staging card in place so a decision is visible at a glance and
+// can't be double-tapped — mirrors deliver()'s Markdown-then-plain fallback,
+// and edits whichever of caption/text the card was actually sent as.
+async function markDecided(ctx, statusLine, cand) {
+  const isPhoto = Boolean(ctx.callbackQuery?.message?.photo);
+  const edit = isPhoto ? ctx.editMessageCaption.bind(ctx) : ctx.editMessageText.bind(ctx);
+  const text = `${statusLine}\n\n${cand.message}`;
+  try {
+    await edit(text, { parse_mode: 'Markdown' });
+  } catch {
+    await edit(text.replace(/[*_~`]/g, '')).catch((e) =>
+      console.error('approval UX: edit failed:', e.message)
+    );
+  }
+  // A dedicated call — folding reply_markup into the text/caption edit above
+  // isn't reliable for actually clearing the keyboard.
+  await ctx.editMessageReplyMarkup(undefined).catch(() => {});
 }
 
 bot.action(/^ok:(.+)$/, async (ctx) => {
   const cand = store.takeStaging(ctx.match[1]);
-  await ctx.answerCbQuery(cand ? 'queued' : 'expired');
-  if (cand) {
-    store.enqueue(cand);
-    await ctx.editMessageReplyMarkup(undefined).catch(() => {});
-    await ctx.reply(`queued (position ${store.queueSize()})`);
+  if (!cand) {
+    await ctx.answerCbQuery('כבר טופל');
+    return;
   }
+  store.enqueue(cand);
+  const pos = store.queueSize();
+  await ctx.answerCbQuery(`✅ אושר — ${pos} בתור`);
+  await markDecided(ctx, `✅ אושר — ${pos} בתור`, cand);
 });
 bot.action(/^no:(.+)$/, async (ctx) => {
-  store.takeStaging(ctx.match[1]);
-  await ctx.answerCbQuery('rejected');
-  await ctx.editMessageReplyMarkup(undefined).catch(() => {});
+  const cand = store.takeStaging(ctx.match[1]);
+  if (!cand) {
+    await ctx.answerCbQuery('כבר טופל');
+    return;
+  }
+  await ctx.answerCbQuery('❌ נדחה');
+  await markDecided(ctx, '❌ נדחה', cand);
+});
+bot.action(/^skip:(.+)$/, async (ctx) => {
+  // Leaves the item in staging, untouched — buttons stay live so you can come
+  // back and decide later (handy while bulk-seeding from a backfill).
+  const pending = store.hasStaging(ctx.match[1]);
+  await ctx.answerCbQuery(pending ? '⏭️ דולג — עדיין ממתין לאישור' : 'כבר טופל');
 });
 
 bot.on('message', async (ctx, next) => {
@@ -98,6 +167,11 @@ bot.command('next', async (ctx) => {
   const n = await publishNext();
   ctx.reply(n ? 'posted the next deal' : 'queue empty');
 });
+bot.command('pending', (ctx) => ctx.reply(`⏳ ${store.stagingSize()} deal(s) awaiting approval`));
+bot.command('clear_pending', (ctx) => {
+  const n = store.clearStaging();
+  ctx.reply(`🧹 נוקו ${n} פריט(ים) ממתינים`);
+});
 
 async function publishNext() {
   const cand = store.dequeue();
@@ -108,8 +182,23 @@ async function publishNext() {
 }
 
 async function main() {
-  await bot.launch();
-  console.log('bot live');
+  console.log('starting bot...');
+
+  // NOTE: bot.launch() intentionally never resolves during normal operation —
+  // it *is* the long-poll loop, and only settles once bot.stop() is called.
+  // Awaiting it (as this used to) silently queues everything after it —
+  // startup logs, the drip interval, the reader — behind a promise that only
+  // fires at shutdown, which looked exactly like a startup hang that only
+  // "unfroze" on Ctrl+C. Confirm connectivity ourselves with getMe() instead,
+  // then fire launch() without awaiting it.
+  const me = await bot.telegram.getMe();
+  bot.botInfo = me; // lets launch() skip its own redundant getMe() call
+  bot.launch().catch((e) => {
+    console.error('bot polling stopped with an error:', e.message);
+    process.exit(1);
+  });
+
+  console.log(`bot live (@${me.username})`);
   console.log(`   mode: ${hasAliKeys() ? 'LIVE (real links)' : 'MOCK (no AliExpress keys)'}`);
   console.log(`   approval: ${autoApprove || !staging ? 'OFF (auto-queue)' : 'ON (tap to approve)'}`);
   console.log(`   drip: 1 deal every ${POST_INTERVAL_MINUTES} min`);
@@ -119,8 +208,15 @@ async function main() {
   }, intervalMs);
 
   if (readerConfigured()) {
-    await startReader((url) => ingest(url));
-    console.log('   reader: ON');
+    console.log('   reader: connecting...');
+    // Never let a stuck/failed reader block the rest of the bot — manual
+    // forwarding must keep working even if the userbot can't connect.
+    startReader((url, sourceText) => ingest(url, undefined, sourceText))
+      .then(() => console.log('   reader: ON'))
+      .catch((e) => {
+        console.error(`   reader: FAILED — ${e.message}`);
+        console.error('   bot continues without it; forward links to the bot manually.');
+      });
   } else {
     console.log('   reader: OFF (forward links to the bot)');
   }

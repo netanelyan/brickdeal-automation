@@ -10,7 +10,8 @@ export function formatMessage(product, link, opts = {}) {
 
   if (product.setId) lines.push(`🆔 מק״ט ${product.setId}`);
   if (product.pieces) lines.push(`🧱 ${product.pieces} חלקים`);
-  if (product.salePrice) lines.push(`💳 ${product.salePrice}₪`);
+  if (product.salePrice) lines.push(`💳 מחיר ${product.salePrice}₪`);
+  lines.push('🛍️ תואם מקור');
   if (product.stars) lines.push(`🌟 ${product.stars} כוכבים`);
 
   lines.push('', `[קישור להזמנה 🛒](${link})`);
