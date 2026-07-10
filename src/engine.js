@@ -137,7 +137,7 @@ export async function urlToMessage(input, { client = makeClient(), debug = false
   if (link.length > 150) link = await shorten(link); // only fires on the fallback
 
   // AI-polish the Hebrew name + pull set id / pieces (no-op without a key)
-  const p = await polish(product.title);
+  const p = await polish(product.title, product.setId);
   if (p.title) product.title = p.title;
   if (p.setId) product.setId = p.setId;
   if (p.pieces) product.pieces = p.pieces;
