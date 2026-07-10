@@ -396,13 +396,28 @@ async function reconnectReader() {
   }
 }
 
+// GramJS retries transient network/update-loop timeouts internally on its
+// own (that's what connectionRetries is for) — `client.disconnected` flips
+// true during those normal blips too, not just on a real, lasting drop.
+// Require it to stay true for several consecutive ticks before we treat it
+// as one; otherwise we'd tear down and rebuild (full backfill included) a
+// connection GramJS was already in the middle of recovering on its own.
+const DISCONNECT_TICKS_BEFORE_ACTION = 3;
+let disconnectedTicks = 0;
+
 // Runs every minute: notices a dropped GramJS connection (`client.disconnected`
 // is a plain property GramJS exposes — no event to subscribe to) and kicks
 // off reconnectReader(), and separately checks the quiet-reader alert.
 function monitorTick() {
   if (readerHealthy && readerClient?.disconnected) {
-    readerHealthy = false;
-    reconnectReader();
+    disconnectedTicks++;
+    if (disconnectedTicks >= DISCONNECT_TICKS_BEFORE_ACTION) {
+      readerHealthy = false;
+      disconnectedTicks = 0;
+      reconnectReader();
+    }
+  } else {
+    disconnectedTicks = 0;
   }
   if (readerHealthy && lastReaderIngestAt) {
     const quietHours = (Date.now() - lastReaderIngestAt) / 3_600_000;
