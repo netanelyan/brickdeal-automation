@@ -45,6 +45,14 @@ export function dealLabel(cand) {
   return (m && m[1]) || cand?.productId || 'מוצר';
 }
 
+// Same idea as dealLabel() — format.js always renders "💳 מחיר X₪" when a
+// price exists, so pull it back out for the /debug trace instead of
+// plumbing a separate price field through candidate.js/engine.js.
+export function dealPrice(cand) {
+  const m = String(cand?.message || '').match(/💳 מחיר ([\d.,]+)₪/);
+  return m ? m[1] : null;
+}
+
 export function qualitySkipSingle(cand, reason) {
   return `🗑️ דולג (איכות): ${dealLabel(cand)} — ${reasonHe(reason)} · ${cand.link}`;
 }
@@ -93,6 +101,7 @@ export function statusReport({
   skippedDedup,
   skippedQuality,
   skippedFailed,
+  failedByReason,
   lastReaderIngestAgoMs,
   autoApprove,
   postIntervalMinutes,
@@ -103,6 +112,9 @@ export function statusReport({
     : '🔴 reader מנותק';
   const lastIngestLine =
     lastReaderIngestAgoMs == null ? 'עדיין לא נקלט כלום מה-reader' : `לפני ${humanDuration(lastReaderIngestAgoMs)}`;
+  const failedBreakdown = Object.entries(failedByReason || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `   • ${failedReasonHe(reason)} (${reason}): ${count}`);
   return [
     '🔎 סטטוס',
     readerLine,
@@ -114,6 +126,7 @@ export function statusReport({
     `🔁 כפולים: ${skippedDedup}`,
     `🗑️ איכות נמוכה: ${skippedQuality}`,
     `❓ לא זוהו כמוצר תקין: ${skippedFailed}`,
+    ...failedBreakdown,
     '',
     `⏱️ דיל אחרון מה-reader: ${lastIngestLine}`,
     '',
@@ -123,11 +136,17 @@ export function statusReport({
 
 // toCandidate()/engine.js speak in these short English codes when the build
 // fails outright (before the low-quality filter even runs) — this is the
-// Hebrew a human reads for /why.
+// Hebrew a human reads for /why and /status's breakdown. `not_a_building_set`
+// is deliberately absent: nothing in the pipeline actually classifies by
+// category today, so that bucket can never appear — it'd be dishonest to map
+// a label for a filter that doesn't exist. Unknown/future codes just fall
+// back to showing the raw code.
 const FAILED_REASON_HE = {
-  no_product_id: 'לא הצליח לזהות מזהה מוצר',
-  not_promotable: 'המוצר לא ניתן לקידום/שיווק',
+  no_product_id: 'לא הצליח לזהות מזהה מוצר (הפענוח נכשל)',
+  not_promotable: 'AliExpress סימן את המוצר כלא ניתן לקידום',
   no_link: 'לא הופק קישור שותפים',
+  api_error: 'שגיאת API של AliExpress',
+  timeout: 'הבקשה ל-AliExpress נתקעה',
 };
 export const failedReasonHe = (reason) => FAILED_REASON_HE[reason] || reason || 'סיבה לא ידועה';
 
@@ -139,8 +158,8 @@ const SKIP_TYPE_LABEL_HE = {
 
 function skipReasonText(entry) {
   if (entry.type === 'skipped_dedup') return 'כבר פורסם בעבר';
-  if (entry.type === 'skipped_quality') return reasonHe(entry.reason);
-  if (entry.type === 'skipped_failed') return failedReasonHe(entry.reason);
+  if (entry.type === 'skipped_quality') return `${reasonHe(entry.reason)} (quality:${entry.reason})`;
+  if (entry.type === 'skipped_failed') return `${failedReasonHe(entry.reason)} (${entry.reason})`;
   return entry.reason || '';
 }
 
@@ -153,4 +172,24 @@ export function whyReport(items) {
     return `${i + 1}. [${tag}] ${e.label} — ${skipReasonText(e)}${link}`;
   });
   return `🔍 ${items.length} הדילים האחרונים שדולגו:\n${lines.join('\n')}`;
+}
+
+// /debug — one message per traced ingest, the full decision path for that
+// single URL. t: { source, url, resolvedProductId, buildOk, title, price,
+// reason, outcome }.
+export function debugTrace(t) {
+  const lines = [
+    '🧪 debug trace',
+    `מקור: ${t.source === 'reader' ? 'reader' : 'ידני'}`,
+    `URL: ${t.url}`,
+    `product ID: ${t.resolvedProductId ?? '—'}`,
+  ];
+  if (t.buildOk === false) {
+    lines.push(`API: נכשל — ${failedReasonHe(t.reason)} (${t.reason})`);
+  } else if (t.buildOk === true) {
+    const bits = [t.title ? `"${t.title}"` : null, t.price ? `${t.price}₪` : null].filter(Boolean);
+    lines.push(`API: הצליח${bits.length ? ' — ' + bits.join(' · ') : ''}`);
+  }
+  lines.push(`תוצאה: ${t.outcome}`);
+  return lines.join('\n');
 }

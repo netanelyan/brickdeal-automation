@@ -125,11 +125,24 @@ export async function urlToMessage(input, { client = makeClient(), debug = false
   const { productId, canonicalUrl, resolvedFrom } = await resolveToProductId(input);
   if (!productId) return { ok: false, reason: 'no_product_id', input };
 
-  const detailResp = await client.productDetail([productId], {
-    targetCurrency: process.env.TARGET_CURRENCY || 'ILS',
-    targetLanguage: process.env.TARGET_LANGUAGE || 'he',
-    country: process.env.TARGET_COUNTRY || 'IL',
-  });
+  // Previously uncaught: a thrown error here (network blip, AliExpress
+  // rate-limit/5xx, or aliClient's own new request timeout) unwound straight
+  // out of this function. Callers did catch it eventually (reader.js's
+  // per-event try/catch), but it never became a countable candidate result —
+  // it just vanished from /status's numbers while `stats.seen` had already
+  // been incremented, which was part of why "seen" and the tracked skip
+  // reasons never added up.
+  let detailResp;
+  try {
+    detailResp = await client.productDetail([productId], {
+      targetCurrency: process.env.TARGET_CURRENCY || 'ILS',
+      targetLanguage: process.env.TARGET_LANGUAGE || 'he',
+      country: process.env.TARGET_COUNTRY || 'IL',
+    });
+  } catch (e) {
+    if (debug) console.error('--- productdetail.get failed ---\n', e.message);
+    return { ok: false, reason: e.code === 'TIMEOUT' ? 'timeout' : 'api_error', productId };
+  }
   if (debug) console.error('--- productdetail.get ---\n', JSON.stringify(detailResp, null, 2));
 
   const product = parseProduct(detailResp);

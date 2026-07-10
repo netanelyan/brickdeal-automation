@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 
 const REST_URL = 'https://api-sg.aliexpress.com/sync';
+const REQUEST_TIMEOUT_MS = 15_000;
 
 // Thin, dependency-free client for the AliExpress affiliate API.
 // Signing scheme (verified against the current SG endpoint):
@@ -38,7 +39,25 @@ export class AliClient {
     params.sign = this.#sign(params);
     const url = `${REST_URL}?${new URLSearchParams(params).toString()}`;
 
-    const res = await fetch(url, { method: 'GET' });
+    // No timeout here previously — a hung request just hung, indistinguishable
+    // from every other failure once it eventually threw or never resolved.
+    // Callers (engine.js) need to tell "AliExpress is slow/unreachable right
+    // now" apart from "AliExpress said no to this specific product".
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(url, { method: 'GET', signal: controller.signal });
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        const err = new Error(`AliExpress request timed out after ${REQUEST_TIMEOUT_MS}ms`);
+        err.code = 'TIMEOUT';
+        throw err;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) throw new Error(`AliExpress HTTP ${res.status}`);
     const json = await res.json();
 

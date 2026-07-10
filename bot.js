@@ -113,21 +113,38 @@ function lowQualityReason(cand) {
   return null;
 }
 
+// Which toCandidate() failure reasons are worth erasing the dedupe claim
+// for, so a *genuinely new* future post of the same product gets a fresh
+// try. `not_promotable` is deliberately excluded: AliExpress said no for
+// that specific product, which won't change moments later, so forgetting it
+// only ever re-does the same doomed lookup. Combined with backfill re-running
+// on every reconnect (fixed separately in reader.js), forgetting *every*
+// failure reason here — the original behavior — was what let the exact same
+// handful of old messages get "seen" and skipped over and over on every
+// reconnect, forever, which is what actually inflated /status's counters.
+const RETRYABLE_FAILURE_REASONS = new Set(['no_product_id', 'no_link', 'api_error', 'timeout']);
+
 // Returns a status string so callers (reader backfill in particular) can
 // tally outcomes: 'duplicate' | 'failed' | 'queued' | 'staged' | 'skipped'.
 // sourceText is the surrounding message text when the URL came from a
 // watched source channel — it's undefined for manual forwards, which keeps
 // working exactly as before.
 async function ingest(url, ctx, sourceText) {
+  const tracing = debugTraceRemaining > 0;
+  if (tracing) debugTraceRemaining--;
+  const trace = tracing ? { source: sourceText !== undefined ? 'reader' : 'manual', url } : null;
+
   stats.seen++;
   // Claim the product ID up front (before the slow AliExpress calls) so two
   // source channels posting the same deal seconds apart can't both slip past
   // the hasSeen check and get staged twice.
   const { productId: preId } = await resolveToProductId(url);
+  if (trace) trace.resolvedProductId = preId || null;
   if (preId) {
     if (store.hasSeen(preId)) {
       stats.skippedDedup++;
       logActivity('skipped_dedup', { productId: preId, url });
+      if (trace) sendTrace({ ...trace, outcome: 'כפול (לפני קריאה ל-API)' });
       if (ctx) ctx.reply('already posted this one');
       return 'duplicate';
     }
@@ -136,10 +153,16 @@ async function ingest(url, ctx, sourceText) {
 
   const cand = await toCandidate(url, sourceText);
   if (!cand.ok) {
-    if (preId) store.forgetSeen(preId); // build failed — don't permanently block a retry
+    if (preId && RETRYABLE_FAILURE_REASONS.has(cand.reason)) store.forgetSeen(preId);
     logActivity('skipped_failed', { url, productId: cand.productId, reason: cand.reason });
+    if (trace) sendTrace({ ...trace, buildOk: false, reason: cand.reason, outcome: 'failed' });
     if (ctx) ctx.reply(`skipped: ${cand.reason}`);
     return 'failed';
+  }
+  if (trace) {
+    trace.buildOk = true;
+    trace.title = notify.dealLabel(cand);
+    trace.price = notify.dealPrice(cand);
   }
   const reason = lowQualityReason(cand);
   if (reason) {
@@ -148,12 +171,14 @@ async function ingest(url, ctx, sourceText) {
     stats.skippedQuality++;
     logActivity('skipped_quality', { cand, reason });
     await notifyQualitySkip(cand, reason);
+    if (trace) sendTrace({ ...trace, reason: `quality:${reason}`, outcome: 'skipped (quality)' });
     if (ctx) ctx.reply(`skipped (low quality): ${reason}`);
     return 'skipped';
   }
   if (!preId && store.hasSeen(cand.productId)) {
     stats.skippedDedup++;
     logActivity('skipped_dedup', { cand });
+    if (trace) sendTrace({ ...trace, outcome: 'כפול (אחרי בניית המועמד)' });
     if (ctx) ctx.reply('already posted this one');
     return 'duplicate';
   }
@@ -162,12 +187,14 @@ async function ingest(url, ctx, sourceText) {
     store.enqueue(cand);
     stats.staged++;
     logActivity('staged', { cand });
+    if (trace) sendTrace({ ...trace, outcome: 'queued' });
     if (ctx) ctx.reply(`queued (position ${store.queueSize()})`);
     return 'queued';
   }
   const key = store.addStaging(cand);
   stats.staged++;
   logActivity('staged', { cand });
+  if (trace) sendTrace({ ...trace, outcome: 'staged' });
   await deliver(staging, cand.message, cand.image, stagingButtons(key));
   return 'staged';
 }
@@ -330,12 +357,23 @@ bot.command('status', async (ctx) => {
   const now = Date.now();
   const dayAgo = now - 24 * 3_600_000;
   const recent = activityLog.filter((e) => e.ts >= dayAgo);
-  const tally = { seen: recent.length, staged: 0, skippedDedup: 0, skippedQuality: 0, skippedFailed: 0 };
+  const tally = {
+    seen: recent.length,
+    staged: 0,
+    skippedDedup: 0,
+    skippedQuality: 0,
+    skippedFailed: 0,
+    failedByReason: {},
+  };
   for (const e of recent) {
     if (e.type === 'staged') tally.staged++;
     else if (e.type === 'skipped_dedup') tally.skippedDedup++;
     else if (e.type === 'skipped_quality') tally.skippedQuality++;
-    else if (e.type === 'skipped_failed') tally.skippedFailed++;
+    else if (e.type === 'skipped_failed') {
+      tally.skippedFailed++;
+      const r = e.reason || 'unknown';
+      tally.failedByReason[r] = (tally.failedByReason[r] || 0) + 1;
+    }
   }
   await ctx.reply(
     notify.statusReport({
@@ -349,6 +387,16 @@ bot.command('status', async (ctx) => {
       sourceChannelCount: sourceChannels().length,
     })
   );
+});
+
+// End-to-end trace for the next N ingested links (default 5, capped 20):
+// source, resolved product ID, API result, and the final skip reason/outcome
+// for each one — DMed as they happen. Also arms on boot if DEBUG=true.
+bot.command('debug', async (ctx) => {
+  const arg = Number((ctx.message.text || '').split(' ')[1]);
+  const n = Number.isFinite(arg) && arg > 0 ? Math.min(Math.floor(arg), 20) : 5;
+  debugTraceRemaining = n;
+  await ctx.reply(`🧪 debug: עוקב אחרי ${n} הדילים הבאים שייקלטו`);
 });
 
 // Companion to /status: the actual skipped deals, not just counts.
@@ -396,6 +444,19 @@ function logActivity(type, { cand, productId, url, reason } = {}) {
     reason: reason || null,
   });
   if (activityLog.length > ACTIVITY_LOG_MAX) activityLog.shift();
+}
+
+// Armed by /debug [n] or DEBUG=true on boot (see main()) — while > 0, the
+// next ingest() call consumes one and DMs its full decision trace.
+let debugTraceRemaining = 0;
+function sendTrace(trace) {
+  try {
+    const text = notify.debugTrace(trace);
+    console.log('[debug-trace]', text.replace(/\n/g, ' | '));
+    notify.send(bot.telegram, staging, text).catch(() => {});
+  } catch (e) {
+    console.error('debug trace failed:', e.message);
+  }
 }
 
 async function notifyQualitySkip(cand, reason) {
@@ -446,10 +507,14 @@ function onReaderUrl(url, sourceText) {
 
 // The one path for "(re)establish the reader connection" — used for the
 // initial connect failing AND for a later drop. Re-running startReader() in
-// full (including its backfill) rather than trying to resume the half-dead
-// GramJS client is deliberate: ingest()'s dedupe already makes re-seeing
-// recent messages a no-op, so a full reconnect is simple *and* safe, instead
-// of hand-rolling a resume path against undocumented client internals.
+// full, rather than trying to resume the half-dead GramJS client, is
+// deliberate — simpler than hand-rolling a resume path against undocumented
+// client internals. This used to also re-run backfill on every call, on the
+// (wrong) assumption that ingest()'s dedupe alone made re-scanning safe —
+// it didn't, because forgetSeen() on most failure reasons undoes that dedupe
+// claim, so the same failing messages got "seen" and skipped again on every
+// reconnect, forever. startReader() now only backfills once per process
+// (see reader.js's hasBackfilled flag), so this is actually safe now.
 async function reconnectReader() {
   if (reconnecting) return;
   reconnecting = true;
@@ -535,6 +600,10 @@ async function main() {
   console.log(`   approval: ${autoApprove || !staging ? 'OFF (auto-queue)' : 'ON (tap to approve)'}`);
   console.log(`   owner lock: ON (only ${OWNER_ID} can use this bot)`);
   console.log(`   drip: 1 deal every ${POST_INTERVAL_MINUTES} min`);
+  if (process.env.DEBUG === 'true') {
+    debugTraceRemaining = 10;
+    console.log('   debug: ON — tracing the first 10 ingests (also: /debug [n] anytime)');
+  }
 
   setInterval(() => {
     publishNext().catch((e) => console.error('publish error:', e.message));

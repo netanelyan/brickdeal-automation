@@ -7,6 +7,19 @@ import { extractUrls } from './resolve.js';
 const CONNECT_TIMEOUT_MS = 20_000;
 const BACKFILL_DELAY_MS = 1200; // throttle so we don't hammer AliExpress/Telegram
 
+// startReader() used to run backfill unconditionally on every call — fine
+// the first time, but bot.js's reconnectReader() calls this same function on
+// every reconnect too, and on a flaky connection that could be every few
+// minutes. Each re-run re-scanned the *same* last BACKFILL_COUNT messages
+// per channel and re-fed them through ingest(), which (combined with
+// forgetSeen() rolling back the dedupe claim on most failure reasons) made
+// the same handful of doomed URLs get "seen" and skipped over and over,
+// forever, inflating /status's counters at a rate that had nothing to do
+// with real channel activity. Backfill is a one-time catch-up by design
+// (see its own doc comment below) — this flag makes that actually true for
+// the lifetime of the process, not just the lifetime of one connection.
+let hasBackfilled = false;
+
 export const readerConfigured = () =>
   Boolean(process.env.TG_API_ID && process.env.TG_API_HASH && process.env.TG_SESSION);
 
@@ -60,6 +73,12 @@ export async function startReader(onUrl) {
   client.onError = async (error) => {
     console.error('reader: GramJS internal error:', error?.message || error);
   };
+  // GramJS's own logger otherwise dumps the full stack trace for every ping
+  // timeout straight to stderr (that's the spam in the logs) — 'none' quiets
+  // it entirely; onError above still gives us a one-line summary of the same
+  // events, and none of our own console.log/console.error calls go through
+  // this logger, so our actual operational logging is unaffected.
+  client.setLogLevel('none');
 
   console.log('   reader: connecting to Telegram (as your worker account)...');
   try {
@@ -102,10 +121,13 @@ export async function startReader(onUrl) {
 
   console.log(`   reader: watching ${sources.length || 'all joined'} source channel(s)${sources.length ? ` (${sources.join(', ')})` : ''}`);
 
-  if (backfillCount > 0 && sources.length) {
+  if (!hasBackfilled && backfillCount > 0 && sources.length) {
+    hasBackfilled = true;
     backfill(client, sources, onUrl, backfillCount).catch((e) =>
       console.error('reader: backfill error:', e.message)
     );
+  } else if (hasBackfilled) {
+    console.log('   reader: skipping backfill (already ran once this process)');
   }
 
   return client;

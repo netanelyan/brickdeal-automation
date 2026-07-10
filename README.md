@@ -77,7 +77,7 @@ framework beyond the two libraries below.
 
 | File | What it does |
 |---|---|
-| `bot.js` | The Telegraf bot: the `OWNER_ID` lock, staging cards and their approve/reject/edit/skip buttons, `/queue` `/next` `/pending` `/clear_pending` `/status` `/why`, the drip-publish timer, reader supervision/reconnect, and startup wiring. |
+| `bot.js` | The Telegraf bot: the `OWNER_ID` lock, staging cards and their approve/reject/edit/skip buttons, `/queue` `/next` `/pending` `/clear_pending` `/status` `/why` `/debug`, the drip-publish timer, reader supervision/reconnect, and startup wiring. |
 | `src/candidate.js` | Turns a raw URL into a stageable candidate — real via `engine.js` when AliExpress keys exist, otherwise a MOCK candidate. |
 | `src/engine.js` | The real pipeline: resolve product ID → `productdetail.get` → generate/shorten affiliate link → AI polish → format the card. |
 | `src/aliClient.js` | Hand-rolled AliExpress affiliate API client — HMAC-SHA256 request signing, automatic retry on rate limits. |
@@ -179,10 +179,17 @@ and reconnecting successfully sends its own "back up" DM.
 
 `/status` is the pull version of all that — reader connection state and how
 long it's been up, current queue size, and a last-24h breakdown (seen /
-staged / duplicates / low-quality / failed-to-resolve), so "why haven't I
-gotten any deals" has an answer on demand instead of waiting for the next
+staged / duplicates / low-quality / failed-to-resolve, and the
+failed-to-resolve bucket broken down by its exact reason — `not_promotable`,
+`no_product_id`, `no_link`, `api_error`, `timeout`), so "why haven't I gotten
+any deals" has an answer on demand instead of waiting for the next
 heartbeat. `/why [n]` is the companion — the actual last `n` skipped deals
 (default 10, capped at 25) with their reason and link, not just the count.
+
+`/debug [n]` (default 5, capped 20) traces the next `n` links end to end as
+they happen — source, resolved product ID, the raw API result, and the
+final outcome, one DM per link. `DEBUG=true` arms the same trace for the
+first 10 links on boot, no command needed.
 
 ## Config reference (`.env`)
 
@@ -195,7 +202,7 @@ Names only — see `.env.example` for the full file with inline comments.
 `POST_INTERVAL_MINUTES`, `AUTO_APPROVE`, `SEEN_TTL_DAYS`
 
 **Monitoring** (status DMs to `STAGING_CHAT_ID`, in Hebrew — see below)
-`HEARTBEAT_HOURS`, `SKIP_DIGEST_HOURS`, `QUALITY_SKIP_NOTIFY`, `QUIET_ALERT_HOURS`
+`HEARTBEAT_HOURS`, `SKIP_DIGEST_HOURS`, `QUALITY_SKIP_NOTIFY`, `QUIET_ALERT_HOURS`, `DEBUG`
 
 **Localisation** (passed straight to AliExpress's `productdetail.get`)
 `TARGET_CURRENCY`, `TARGET_LANGUAGE`, `TARGET_COUNTRY`
