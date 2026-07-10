@@ -107,6 +107,7 @@ async function ingest(url, ctx, sourceText) {
   if (preId) {
     if (store.hasSeen(preId)) {
       stats.skippedDedup++;
+      logActivity('skipped_dedup', { productId: preId, url });
       if (ctx) ctx.reply('already posted this one');
       return 'duplicate';
     }
@@ -116,6 +117,7 @@ async function ingest(url, ctx, sourceText) {
   const cand = await toCandidate(url, sourceText);
   if (!cand.ok) {
     if (preId) store.forgetSeen(preId); // build failed — don't permanently block a retry
+    logActivity('skipped_failed', { url, productId: cand.productId, reason: cand.reason });
     if (ctx) ctx.reply(`skipped: ${cand.reason}`);
     return 'failed';
   }
@@ -124,12 +126,14 @@ async function ingest(url, ctx, sourceText) {
     if (preId) store.forgetSeen(preId); // a future post of the same product may carry better info
     console.log(`ingest: skipped low-quality deal ${cand.productId} — ${reason}`);
     stats.skippedQuality++;
+    logActivity('skipped_quality', { cand, reason });
     await notifyQualitySkip(cand, reason);
     if (ctx) ctx.reply(`skipped (low quality): ${reason}`);
     return 'skipped';
   }
   if (!preId && store.hasSeen(cand.productId)) {
     stats.skippedDedup++;
+    logActivity('skipped_dedup', { cand });
     if (ctx) ctx.reply('already posted this one');
     return 'duplicate';
   }
@@ -137,11 +141,13 @@ async function ingest(url, ctx, sourceText) {
   if (autoApprove || !staging) {
     store.enqueue(cand);
     stats.staged++;
+    logActivity('staged', { cand });
     if (ctx) ctx.reply(`queued (position ${store.queueSize()})`);
     return 'queued';
   }
   const key = store.addStaging(cand);
   stats.staged++;
+  logActivity('staged', { cand });
   await deliver(staging, cand.message, cand.image, stagingButtons(key));
   return 'staged';
 }
@@ -297,6 +303,46 @@ bot.command('clear_pending', (ctx) => {
   ctx.reply(`🧹 נוקו ${n} פריט(ים) ממתינים`);
 });
 
+// On-demand version of the heartbeat, for "why haven't I gotten deals" —
+// fixed last-24h window rather than "since the last heartbeat", so it
+// doesn't depend on HEARTBEAT_HOURS to be a useful answer.
+bot.command('status', async (ctx) => {
+  const now = Date.now();
+  const dayAgo = now - 24 * 3_600_000;
+  const recent = activityLog.filter((e) => e.ts >= dayAgo);
+  const tally = { seen: recent.length, staged: 0, skippedDedup: 0, skippedQuality: 0, skippedFailed: 0 };
+  for (const e of recent) {
+    if (e.type === 'staged') tally.staged++;
+    else if (e.type === 'skipped_dedup') tally.skippedDedup++;
+    else if (e.type === 'skipped_quality') tally.skippedQuality++;
+    else if (e.type === 'skipped_failed') tally.skippedFailed++;
+  }
+  await ctx.reply(
+    notify.statusReport({
+      readerOn: readerHealthy,
+      readerSinceMs: readerHealthy && readerConnectedSince ? now - readerConnectedSince : null,
+      queueSize: store.queueSize(),
+      ...tally,
+      lastReaderIngestAgoMs: lastReaderIngestAt ? now - lastReaderIngestAt : null,
+      autoApprove,
+      postIntervalMinutes: POST_INTERVAL_MINUTES,
+      sourceChannelCount: sourceChannels().length,
+    })
+  );
+});
+
+// Companion to /status: the actual skipped deals, not just counts.
+// `/why 20` for more than the default 10; capped so it can't turn into a wall of text.
+bot.command('why', async (ctx) => {
+  const arg = Number((ctx.message.text || '').split(' ')[1]);
+  const n = Number.isFinite(arg) && arg > 0 ? Math.min(Math.floor(arg), 25) : 10;
+  const items = activityLog
+    .filter((e) => e.type.startsWith('skipped_'))
+    .slice(-n)
+    .reverse();
+  await ctx.reply(notify.whyReport(items));
+});
+
 async function publishNext() {
   const cand = store.dequeue();
   if (!cand) return false;
@@ -314,6 +360,23 @@ async function publishNext() {
 
 let stats = { seen: 0, staged: 0, skippedQuality: 0, skippedDedup: 0 };
 let qualitySkipQueue = []; // [{ cand, reason }] — drained by the digest timer
+
+// Ring buffer of recent ingest outcomes — powers /status (tallied over the
+// last 24h) and /why (the actual items, not just counts). Kept separate from
+// `stats` above (which tracks "since the last heartbeat") since /status
+// deliberately wants a fixed window regardless of HEARTBEAT_HOURS.
+let activityLog = [];
+const ACTIVITY_LOG_MAX = 500;
+function logActivity(type, { cand, productId, url, reason } = {}) {
+  activityLog.push({
+    ts: Date.now(),
+    type, // 'staged' | 'skipped_dedup' | 'skipped_quality' | 'skipped_failed'
+    label: cand ? notify.dealLabel(cand) : productId || 'מוצר',
+    link: cand?.link || url || null,
+    reason: reason || null,
+  });
+  if (activityLog.length > ACTIVITY_LOG_MAX) activityLog.shift();
+}
 
 async function notifyQualitySkip(cand, reason) {
   if (QUALITY_SKIP_NOTIFY === 'each') {
@@ -341,6 +404,7 @@ function sendQualityDigest() {
 // --- reader supervision ---
 let readerClient = null;
 let readerHealthy = false;
+let readerConnectedSince = null; // for /status's "connected for how long"
 let reconnecting = false;
 let reconnectFails = 0;
 let outageAlerted = false; // "reader is down" DM sent for the *current* outage
@@ -373,6 +437,7 @@ async function reconnectReader() {
   try {
     readerClient = await startReader(onReaderUrl);
     readerHealthy = true;
+    readerConnectedSince = Date.now();
     if (outageAlerted) await notify.send(bot.telegram, staging, notify.readerReconnected());
     reconnectFails = 0;
     outageAlerted = false;
@@ -465,6 +530,7 @@ async function main() {
     try {
       readerClient = await startReader(onReaderUrl);
       readerHealthy = true;
+      readerConnectedSince = Date.now();
       console.log('   reader: ON');
     } catch (e) {
       console.error(`   reader: FAILED — ${e.message}`);

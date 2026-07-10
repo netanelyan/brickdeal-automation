@@ -77,7 +77,7 @@ framework beyond the two libraries below.
 
 | File | What it does |
 |---|---|
-| `bot.js` | The Telegraf bot: the `OWNER_ID` lock, staging cards and their approve/reject/edit/skip buttons, `/queue` `/next` `/pending` `/clear_pending`, the drip-publish timer, reader supervision/reconnect, and startup wiring. |
+| `bot.js` | The Telegraf bot: the `OWNER_ID` lock, staging cards and their approve/reject/edit/skip buttons, `/queue` `/next` `/pending` `/clear_pending` `/status` `/why`, the drip-publish timer, reader supervision/reconnect, and startup wiring. |
 | `src/candidate.js` | Turns a raw URL into a stageable candidate — real via `engine.js` when AliExpress keys exist, otherwise a MOCK candidate. |
 | `src/engine.js` | The real pipeline: resolve product ID → `productdetail.get` → generate/shorten affiliate link → AI polish → format the card. |
 | `src/aliClient.js` | Hand-rolled AliExpress affiliate API client — HMAC-SHA256 request signing, automatic retry on rate limits. |
@@ -176,6 +176,13 @@ repeatedly, if the reader's connected but hasn't ingested anything in
 by automatic reconnect attempts with backoff (30s → 1m → 2m → 4m → 5m, then
 holding at 5m). A second alert fires if it's still down after 5 attempts,
 and reconnecting successfully sends its own "back up" DM.
+
+`/status` is the pull version of all that — reader connection state and how
+long it's been up, current queue size, and a last-24h breakdown (seen /
+staged / duplicates / low-quality / failed-to-resolve), so "why haven't I
+gotten any deals" has an answer on demand instead of waiting for the next
+heartbeat. `/why [n]` is the companion — the actual last `n` skipped deals
+(default 10, capped at 25) with their reason and link, not just the count.
 
 ## Config reference (`.env`)
 

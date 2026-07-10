@@ -70,3 +70,87 @@ export function readerReconnected() {
 export function readerStillDown(attempts) {
   return `🔴 ה-reader עדיין לא מצליח להתחבר אחרי ${attempts} ניסיונות — ממשיך לנסות ברקע`;
 }
+
+// "3 שעות ו-14 דק'" / "14 דק'" — good enough precision for a status readout,
+// no need for seconds.
+export function humanDuration(ms) {
+  if (ms == null) return null;
+  const totalMin = Math.max(0, Math.floor(ms / 60_000));
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h} שעות ו-${m} דק'` : `${m} דק'`;
+}
+
+// /status — an on-demand snapshot, same numbers the heartbeat would show but
+// for a fixed last-24h window instead of "since the last heartbeat fired"
+// (which drifts with HEARTBEAT_HOURS and wouldn't answer "why nothing today").
+export function statusReport({
+  readerOn,
+  readerSinceMs,
+  queueSize,
+  seen,
+  staged,
+  skippedDedup,
+  skippedQuality,
+  skippedFailed,
+  lastReaderIngestAgoMs,
+  autoApprove,
+  postIntervalMinutes,
+  sourceChannelCount,
+}) {
+  const readerLine = readerOn
+    ? `🟢 reader מחובר (${humanDuration(readerSinceMs)})`
+    : '🔴 reader מנותק';
+  const lastIngestLine =
+    lastReaderIngestAgoMs == null ? 'עדיין לא נקלט כלום מה-reader' : `לפני ${humanDuration(lastReaderIngestAgoMs)}`;
+  return [
+    '🔎 סטטוס',
+    readerLine,
+    `📦 בתור: ${queueSize}`,
+    '',
+    'ב-24 השעות האחרונות:',
+    `👀 נקלטו: ${seen}`,
+    `✅ עלו לתור/לאישור: ${staged}`,
+    `🔁 כפולים: ${skippedDedup}`,
+    `🗑️ איכות נמוכה: ${skippedQuality}`,
+    `❓ לא זוהו כמוצר תקין: ${skippedFailed}`,
+    '',
+    `⏱️ דיל אחרון מה-reader: ${lastIngestLine}`,
+    '',
+    `⚙️ AUTO_APPROVE=${autoApprove} · דריפ כל ${postIntervalMinutes} דק' · ${sourceChannelCount} ערוצי מקור`,
+  ].join('\n');
+}
+
+// toCandidate()/engine.js speak in these short English codes when the build
+// fails outright (before the low-quality filter even runs) — this is the
+// Hebrew a human reads for /why.
+const FAILED_REASON_HE = {
+  no_product_id: 'לא הצליח לזהות מזהה מוצר',
+  not_promotable: 'המוצר לא ניתן לקידום/שיווק',
+  no_link: 'לא הופק קישור שותפים',
+};
+export const failedReasonHe = (reason) => FAILED_REASON_HE[reason] || reason || 'סיבה לא ידועה';
+
+const SKIP_TYPE_LABEL_HE = {
+  skipped_dedup: 'כפול',
+  skipped_quality: 'איכות',
+  skipped_failed: 'לא זוהה',
+};
+
+function skipReasonText(entry) {
+  if (entry.type === 'skipped_dedup') return 'כבר פורסם בעבר';
+  if (entry.type === 'skipped_quality') return reasonHe(entry.reason);
+  if (entry.type === 'skipped_failed') return failedReasonHe(entry.reason);
+  return entry.reason || '';
+}
+
+// /why — items: [{ type, label, link, reason }], most recent first.
+export function whyReport(items) {
+  if (!items.length) return '✅ שום דבר לא דולג לאחרונה';
+  const lines = items.map((e, i) => {
+    const tag = SKIP_TYPE_LABEL_HE[e.type] || e.type;
+    const link = e.link ? ` · ${e.link}` : '';
+    return `${i + 1}. [${tag}] ${e.label} — ${skipReasonText(e)}${link}`;
+  });
+  return `🔍 ${items.length} הדילים האחרונים שדולגו:\n${lines.join('\n')}`;
+}
