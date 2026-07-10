@@ -51,6 +51,16 @@ export async function startReader(onUrl) {
     connection: ConnectionTCPObfuscated,
   });
 
+  // Routes GramJS's own internal error hook (the handful of spots in its
+  // source that check `client._errorHandler` before falling through to a
+  // bare console.error) through our logging instead. Defense in depth, not
+  // a full fix — GramJS's reconnect() has at least one internal promise
+  // chain that never checks this hook at all (see the process.on(...)
+  // handlers in bot.js, which are what actually catches that one).
+  client.onError = async (error) => {
+    console.error('reader: GramJS internal error:', error?.message || error);
+  };
+
   console.log('   reader: connecting to Telegram (as your worker account)...');
   try {
     await withTimeout(client.connect(), CONNECT_TIMEOUT_MS, 'reader connect');

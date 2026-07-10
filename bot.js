@@ -8,6 +8,26 @@ import * as store from './src/store.js';
 import { readerConfigured, startReader, sourceChannels } from './src/reader.js';
 import * as notify from './src/notify.js';
 
+// Last-resort safety net. Root cause of the crash loop: GramJS's own
+// MTProtoSender.reconnect() (network/MTProtoSender.js) does
+// `sleep(1000).then(() => this._reconnect())` with no `.catch()` anywhere in
+// that chain, and _reconnect()'s own `await this.connect(newConnection, true)`
+// isn't wrapped in try/catch either. On a network flaky enough that a
+// reconnect attempt itself fails — exactly what we've been seeing — that
+// rejection is never caught by GramJS, and Node's default behavior since v15
+// is to crash the process on an unhandled rejection. pm2 then restarts a
+// fresh process, which reruns main() — including a full backfill — from
+// scratch, every time. This isn't a gap in our code that can be closed by
+// wrapping our own calls; the throw happens entirely inside a third-party
+// promise chain we never get a reference to. Catching it here, at the
+// process boundary, is what actually stops the crash loop.
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandled rejection (kept process alive):', reason?.stack || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('uncaught exception (kept process alive):', err?.stack || err);
+});
+
 const {
   TG_BOT_TOKEN,
   CHANNEL_ID,
