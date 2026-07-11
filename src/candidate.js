@@ -13,9 +13,12 @@ export const hasAliKeys = () =>
 // sourceText is the surrounding message text when the URL came from a
 // watched source channel (empty for manual forwards) — used to fill in the
 // set number / piece count when the AliExpress title doesn't have them.
-export async function toCandidate(url, sourceText = '') {
+// `resolved` — see urlToMessage()'s doc comment in engine.js — is the
+// caller's already-computed resolveToProductId(url) result, so it doesn't
+// get resolved a second time here.
+export async function toCandidate(url, sourceText = '', resolved = null) {
   if (hasAliKeys()) {
-    const r = await urlToMessage(url, { sourceText });
+    const r = await urlToMessage(url, { sourceText, resolved });
     if (!r.ok) return { ok: false, reason: r.reason, productId: r.productId };
     return {
       ok: true,
@@ -29,7 +32,7 @@ export async function toCandidate(url, sourceText = '') {
     };
   }
 
-  const { productId } = await resolveToProductId(url);
+  const { productId } = resolved || (await resolveToProductId(url));
   if (!productId) return { ok: false, reason: 'no_product_id' };
   const setId = extractSetIdFromText(sourceText);
   const pieces = extractPiecesFromText(sourceText);

@@ -121,8 +121,13 @@ function parseLink(resp) {
   return first?.promotion_link || null;
 }
 
-export async function urlToMessage(input, { client = makeClient(), debug = false, sourceText = '' } = {}) {
-  const { productId, canonicalUrl, resolvedFrom } = await resolveToProductId(input);
+// `resolved` lets a caller that already ran resolveToProductId() (ingest()'s
+// pre-dedupe-check resolution, in bot.js) pass that result straight through
+// instead of resolving the same URL a second time — resolveToProductId()
+// hits the network to follow short-link redirects, so skipping the repeat
+// avoids doubling that request on every single ingest.
+export async function urlToMessage(input, { client = makeClient(), debug = false, sourceText = '', resolved = null } = {}) {
+  const { productId, canonicalUrl, resolvedFrom } = resolved || (await resolveToProductId(input));
   if (!productId) return { ok: false, reason: 'no_product_id', input };
 
   // Previously uncaught: a thrown error here (network blip, AliExpress

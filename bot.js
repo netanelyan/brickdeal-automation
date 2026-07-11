@@ -138,7 +138,8 @@ async function ingest(url, ctx, sourceText) {
   // Claim the product ID up front (before the slow AliExpress calls) so two
   // source channels posting the same deal seconds apart can't both slip past
   // the hasSeen check and get staged twice.
-  const { productId: preId } = await resolveToProductId(url);
+  const resolution = await resolveToProductId(url);
+  const { productId: preId } = resolution;
   if (trace) trace.resolvedProductId = preId || null;
   if (preId) {
     if (store.hasSeen(preId)) {
@@ -151,7 +152,10 @@ async function ingest(url, ctx, sourceText) {
     store.markSeen(preId);
   }
 
-  const cand = await toCandidate(url, sourceText);
+  // Pass the resolution through instead of letting toCandidate() re-resolve
+  // the same URL — resolveToProductId() makes a network call to follow
+  // short-link redirects, so this avoids doubling that call on every ingest.
+  const cand = await toCandidate(url, sourceText, resolution);
   if (!cand.ok) {
     if (preId && RETRYABLE_FAILURE_REASONS.has(cand.reason)) store.forgetSeen(preId);
     logActivity('skipped_failed', { url, productId: cand.productId, reason: cand.reason });
@@ -515,10 +519,31 @@ function onReaderUrl(url, sourceText) {
 // claim, so the same failing messages got "seen" and skipped again on every
 // reconnect, forever. startReader() now only backfills once per process
 // (see reader.js's hasBackfilled flag), so this is actually safe now.
+//
+// Root cause of the message-multiplication storm: this used to call
+// readerClient.disconnect() here, not .destroy(). disconnect() stops the
+// sender's send/recv loops but does NOT clear the client's registered event
+// handlers (_eventBuilders) or set _destroyed (which stops the internal
+// ping/update loop) — only destroy() does both. GramJS's own internal
+// auto-reconnect (MTProtoSender.reconnect(), the same uncaught chain
+// 49de491 papered over at the process level) schedules its retry via a bare
+// `sleep(1000).then(() => this._reconnect())` with no re-check of
+// _userConnected/userDisconnected afterward — so if that timer was already
+// in flight when we called disconnect() here, it fires anyway a second
+// later, flips the "dead" client's _userConnected back to true, and resumes
+// its receive loop. Because disconnect() left that client's NewMessage
+// handler attached, the revived zombie starts dispatching every subsequent
+// live channel message straight into onReaderUrl() again — in parallel with
+// the fresh client startReader() just created below. Each such race is
+// permanent (nothing ever tears the zombie down), so they accumulate over a
+// day into exactly the "same handful of messages processed ~100x" pattern,
+// with dedupe catching most of the pileup as duplicates. destroy() closes
+// this race: it clears _eventBuilders, so even a revived zombie has no
+// handler left to dispatch to.
 async function reconnectReader() {
   if (reconnecting) return;
   reconnecting = true;
-  await readerClient?.disconnect().catch(() => {});
+  await readerClient?.destroy().catch(() => {});
   try {
     readerClient = await startReader(onReaderUrl);
     readerHealthy = true;
@@ -547,19 +572,32 @@ async function reconnectReader() {
 }
 
 // GramJS retries transient network/update-loop timeouts internally on its
-// own (that's what connectionRetries is for) — `client.disconnected` flips
-// true during those normal blips too, not just on a real, lasting drop.
-// Require it to stay true for several consecutive ticks before we treat it
-// as one; otherwise we'd tear down and rebuild (full backfill included) a
+// own (that's what connectionRetries is for) — the connection can flip
+// during those normal blips too, not just on a real, lasting drop. Require
+// it to stay down for several consecutive ticks before we treat it as one;
+// otherwise we'd tear down and rebuild (full backfill included) a
 // connection GramJS was already in the middle of recovering on its own.
+//
+// Deliberately reads `readerClient.connected` (MTProtoSender.isConnected(),
+// backed by `_userConnected` — toggles correctly through the real
+// connect/disconnect lifecycle), NOT `.disconnected`. `.disconnected` reads
+// `_sender._disconnected`, a field GramJS's own MTProtoSender sets to `true`
+// once in its constructor and never reassigns anywhere else in the library
+// — so it reads permanently `true` for any client that has ever connected,
+// healthy or not. Using it here meant this check was true unconditionally
+// ~3 minutes after every boot or reconnect, forcing reconnectReader() (full
+// client teardown/rebuild) roughly every 3 minutes around the clock
+// regardless of actual connection health — which was also what made the
+// disconnect()-vs-destroy() zombie-client race above so easy to hit: it
+// gave GramJS's internal auto-reconnect ~480 chances a day to race our
+// teardown instead of only during genuine network flakiness.
 const DISCONNECT_TICKS_BEFORE_ACTION = 3;
 let disconnectedTicks = 0;
 
-// Runs every minute: notices a dropped GramJS connection (`client.disconnected`
-// is a plain property GramJS exposes — no event to subscribe to) and kicks
-// off reconnectReader(), and separately checks the quiet-reader alert.
+// Runs every minute: notices a dropped GramJS connection and kicks off
+// reconnectReader(), and separately checks the quiet-reader alert.
 function monitorTick() {
-  if (readerHealthy && readerClient?.disconnected) {
+  if (readerHealthy && readerClient && !readerClient.connected) {
     disconnectedTicks++;
     if (disconnectedTicks >= DISCONNECT_TICKS_BEFORE_ACTION) {
       readerHealthy = false;
