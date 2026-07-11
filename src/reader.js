@@ -1,11 +1,50 @@
-import { TelegramClient } from 'telegram';
+import { TelegramClient, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
-import { NewMessage } from 'telegram/events/index.js';
+import { NewMessage, Raw } from 'telegram/events/index.js';
 import { ConnectionTCPObfuscated } from 'telegram/network/index.js';
 import { extractUrls } from './resolve.js';
 
 const CONNECT_TIMEOUT_MS = 20_000;
 const BACKFILL_DELAY_MS = 1200; // throttle so we don't hammer AliExpress/Telegram
+
+// TEMPORARY diagnostic logging for "live reader receives nothing" — set
+// READER_VERBOSE=false to quiet it once the root cause is confirmed. Prints:
+// (a) explicit per-source entity resolution at startup, (b) every single raw
+// update the account receives (via a Raw/no-filter handler, registered
+// before the NewMessage handler — see the comment above that registration
+// for why the ordering matters), and (c) a periodic liveness heartbeat so a
+// silently-dead update loop shows up as a flatlined counter instead of just
+// "nothing happened."
+const READER_VERBOSE = process.env.READER_VERBOSE !== 'false';
+const HEARTBEAT_INTERVAL_MS = 5 * 60_000;
+
+function peerIdOf(peer) {
+  try {
+    return utils.getPeerId(peer);
+  } catch {
+    return null;
+  }
+}
+
+// Summarizes any raw Api.TypeUpdate for the verbose log: className, the
+// chat it's about (if it carries a message), whether that chat matches one
+// of our resolved source channels, and whether an AliExpress URL was found
+// — everything needed to see whether @brickclones' posts even arrive at the
+// transport level, independent of the NewMessage event filter.
+function describeUpdate(update, knownSourceIds) {
+  const className = update.className || update.constructor?.name || 'unknown update';
+  // UpdateNewChannelMessage / UpdateNewMessage / UpdateEditChannelMessage etc.
+  // carry a nested Api.Message at `.message`; UpdateShortMessage /
+  // UpdateShortChatMessage carry the text directly as a string at `.message`.
+  const nested = update.message;
+  const text = typeof nested === 'string' ? nested : nested?.message;
+  if (typeof text !== 'string') return className;
+  const peerId = typeof nested === 'string' ? null : peerIdOf(nested.peerId);
+  const known = peerId != null && knownSourceIds.has(peerId);
+  const hasUrl = extractUrls(text).length > 0;
+  const preview = text.slice(0, 60).replace(/\s+/g, ' ');
+  return `${className} chat=${peerId ?? '(short/private)'} knownSource=${known} hasUrl=${hasUrl} text="${preview}"`;
+}
 
 // startReader() used to run backfill unconditionally on every call — fine
 // the first time, but bot.js's reconnectReader() calls this same function on
@@ -101,14 +140,65 @@ export async function startReader(onUrl) {
     if (!authorized) throw new Error('session is not authorized — regenerate it with `npm run login`');
     me = await withTimeout(client.getMe(), CONNECT_TIMEOUT_MS, 'reader getMe');
   } catch (e) {
-    await client.disconnect().catch(() => {});
+    await client.destroy().catch(() => {});
     throw new Error(`session invalid — ${e.message}`);
   }
   const who = me?.username ? `@${me.username}` : me?.id ? `id ${me.id}` : 'unknown account';
   console.log(`   reader: connected as ${who}`);
 
+  // Resolve each source channel explicitly, up front, instead of leaving it
+  // to NewMessage's own lazy chats-filter resolution (which only runs on
+  // the *first* dispatched update — see the comment on the Raw handler
+  // below for why a failure there is easy to miss). This surfaces "account
+  // isn't actually a member" / "handle doesn't resolve" immediately in the
+  // logs, and warms the entity cache so the NewMessage filter's own
+  // resolution moments later hits cache instead of a cold network lookup.
+  const knownSourceIds = new Set();
+  for (const src of sources) {
+    try {
+      const entity = await client.getEntity(src);
+      const id = peerIdOf(entity) ?? String(entity?.id ?? '?');
+      knownSourceIds.add(id);
+      console.log(`   reader: resolved source ${src} -> ${id} (${entity?.title || entity?.username || 'no title'})`);
+    } catch (e) {
+      console.error(`   reader: FAILED to resolve source ${src} — ${e.message}`);
+    }
+  }
+
+  // Registered BEFORE the NewMessage handler, and deliberately with no
+  // `chats` filter (Raw's own resolve() is a synchronous no-op — see
+  // events/Raw.js — so it can never throw here). This matters because
+  // _dispatchUpdate (telegram/client/updates.js) calls `await
+  // builder.resolve(client)` for each registered handler in a plain
+  // for-loop with NO try/catch around that call — if an earlier handler's
+  // resolve() throws (e.g. NewMessage's chats-filter resolution failing to
+  // look up a source channel), the exception aborts the loop and every
+  // handler registered *after* it never runs for that update, or any
+  // update, until resolution succeeds. Putting the always-succeeds Raw
+  // handler first guarantees it keeps logging even if the NewMessage
+  // handler's own filter resolution is the thing silently broken.
+  let rawUpdateCount = 0;
+  let lastRawUpdateAt = null;
+  if (READER_VERBOSE) {
+    client.addEventHandler((update) => {
+      rawUpdateCount++;
+      lastRawUpdateAt = Date.now();
+      console.log(`   reader[raw]: ${describeUpdate(update, knownSourceIds)}`);
+    }, new Raw({}));
+    setInterval(() => {
+      const ago = lastRawUpdateAt ? `${Math.round((Date.now() - lastRawUpdateAt) / 1000)}s ago` : 'never';
+      console.log(
+        `   reader[heartbeat]: ${rawUpdateCount} raw update(s) total · last one ${ago} · client.connected=${client.connected}`
+      );
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
   client.addEventHandler(async (event) => {
     const text = event?.message?.message;
+    if (READER_VERBOSE) {
+      const peerId = peerIdOf(event?.message?.peerId);
+      console.log(`   reader[filtered]: chat=${peerId ?? '?'} hasText=${Boolean(text)}${text ? ` text="${text.slice(0, 60).replace(/\s+/g, ' ')}"` : ''}`);
+    }
     if (!text) return;
     for (const url of extractUrls(text)) {
       try {
