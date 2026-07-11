@@ -88,7 +88,7 @@ framework beyond the two libraries below.
 | `src/shorten.js` | Last-resort URL shortener chain (v.gd → is.gd → tinyurl) for the rare affiliate link too long for a caption. |
 | `src/store.js` | The whole persistence layer — dedupe (TTL'd), publish queue, staging map, and pending-edit state — as one JSON file. |
 | `src/notify.js` | The Hebrew status DMs (startup ping, heartbeat, quality-skip visibility, quiet/reader alerts) — pure formatters plus one thin `send`. |
-| `src/reader.js` | Optional GramJS userbot: live-watches source channels and does a throttled backfill of recent history on startup. |
+| `src/reader.js` | Optional GramJS userbot: watches source channels (live push where Telegram delivers it, otherwise a `CHANNEL_POLL_MINUTES` poll of each channel's latest messages — broadcast channels don't reliably push to a plain user client) and does a throttled backfill of recent history on startup. |
 | `src/env.js` | A ~10-line `.env` loader, so the project doesn't need a `dotenv` dependency. |
 | `login.js` | One-time interactive script that generates the `TG_SESSION` string the reader needs. |
 | `test.js` | CLI: run one URL through the real engine and print the resulting card, without touching Telegram at all. |
@@ -211,7 +211,7 @@ Names only — see `.env.example` for the full file with inline comments.
 `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`
 
 **Auto-reader (optional)**
-`TG_API_ID`, `TG_API_HASH`, `TG_SESSION`, `SOURCE_CHANNELS`, `BACKFILL_COUNT`
+`TG_API_ID`, `TG_API_HASH`, `TG_SESSION`, `SOURCE_CHANNELS`, `BACKFILL_COUNT`, `CHANNEL_POLL_MINUTES`, `READER_VERBOSE`
 
 **AliExpress**
 `ALI_APP_KEY`, `ALI_APP_SECRET`, `ALI_TRACKING_ID`, `ALI_APP_SIGNATURE`,

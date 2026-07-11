@@ -5,7 +5,7 @@ import { Telegraf, Markup } from 'telegraf';
 import { extractUrls, resolveToProductId } from './src/resolve.js';
 import { toCandidate, hasAliKeys } from './src/candidate.js';
 import * as store from './src/store.js';
-import { readerConfigured, startReader, sourceChannels } from './src/reader.js';
+import { readerConfigured, startReader, stopReader, sourceChannels } from './src/reader.js';
 import * as notify from './src/notify.js';
 
 // Last-resort safety net. Root cause of the crash loop: GramJS's own
@@ -543,7 +543,11 @@ function onReaderUrl(url, sourceText) {
 async function reconnectReader() {
   if (reconnecting) return;
   reconnecting = true;
-  await readerClient?.destroy().catch(() => {});
+  // stopReader() (not a bare .destroy()) — the client owns timers now too
+  // (the poll fallback and verbose heartbeat in reader.js), and destroy()
+  // has no idea about those; leaving them running would leak another
+  // poller into the background on every reconnect.
+  await stopReader(readerClient);
   try {
     readerClient = await startReader(onReaderUrl);
     readerHealthy = true;

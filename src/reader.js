@@ -146,6 +146,29 @@ export async function startReader(onUrl) {
   const who = me?.username ? `@${me.username}` : me?.id ? `id ${me.id}` : 'unknown account';
   console.log(`   reader: connected as ${who}`);
 
+  // Timers this client owns (poll + verbose heartbeat, below) — collected
+  // here so stopReader() can clear all of them before tearing the client
+  // down. Without this, every reconnectReader() call would leak another
+  // copy of the poller running forever in the background, silently
+  // multiplying ingestion again — exactly the class of bug the last fix
+  // (disconnect() vs destroy()) closed for event handlers; timers need the
+  // same treatment since destroy() doesn't touch them.
+  client._readerTimers = [];
+
+  // Standard mitigation for "userbot doesn't receive live updates for a
+  // channel it's joined": without an explicit getDialogs() call, Telegram
+  // has no reason to establish this account's per-channel update state
+  // (pts), and this GramJS version's catchUp() is a literal no-op (see
+  // client/updates.js) — there's no client-side fallback to request missed
+  // state either. Cheap and safe to call even if it doesn't fully fix
+  // delivery, which is why the poller below exists as the actual guarantee.
+  try {
+    await client.getDialogs({ limit: 100 });
+    console.log('   reader: warmed dialog list (getDialogs)');
+  } catch (e) {
+    console.error('   reader: getDialogs failed —', e.message);
+  }
+
   // Resolve each source channel explicitly, up front, instead of leaving it
   // to NewMessage's own lazy chats-filter resolution (which only runs on
   // the *first* dispatched update — see the comment on the Raw handler
@@ -185,12 +208,12 @@ export async function startReader(onUrl) {
       lastRawUpdateAt = Date.now();
       console.log(`   reader[raw]: ${describeUpdate(update, knownSourceIds)}`);
     }, new Raw({}));
-    setInterval(() => {
+    client._readerTimers.push(setInterval(() => {
       const ago = lastRawUpdateAt ? `${Math.round((Date.now() - lastRawUpdateAt) / 1000)}s ago` : 'never';
       console.log(
         `   reader[heartbeat]: ${rawUpdateCount} raw update(s) total · last one ${ago} · client.connected=${client.connected}`
       );
-    }, HEARTBEAT_INTERVAL_MS);
+    }, HEARTBEAT_INTERVAL_MS));
   }
 
   client.addEventHandler(async (event) => {
@@ -220,7 +243,94 @@ export async function startReader(onUrl) {
     console.log('   reader: skipping backfill (already ran once this process)');
   }
 
+  // Confirmed in production: live push (UpdateNewChannelMessage) reliably
+  // reaches this account for a group it's active in, but never arrives at
+  // all for broadcast channels it's only a passive member of — raw updates
+  // for those show nothing but UpdateConnectionState/UpdateUserStatus
+  // noise, even while the channel is actively posting. That matches a known
+  // MTProto/GramJS gap: broadcast-channel push depends on proper
+  // channel-difference (pts) state that this library's catchUp() doesn't
+  // implement (see the TODO in client/updates.js) — the getDialogs() call
+  // above is the standard mitigation, but isn't guaranteed to fix delivery
+  // on its own. Polling doesn't depend on push arriving at all, so it's the
+  // actual guarantee here; the live handler stays registered too in case
+  // push does start working, and any overlap between the two is a no-op —
+  // ingest()'s dedupe already skips a re-seen product before any external
+  // API call.
+  if (sources.length) {
+    client._readerTimers.push(pollChannels(client, sources, onUrl));
+  }
+
   return client;
+}
+
+// Clears every timer a client owns (poll + verbose heartbeat) before
+// destroying it. Plain client.destroy() only stops the client's own
+// send/receive loops and event handlers — it has no idea about timers we
+// started ourselves, so without this, every reconnect would leak another
+// copy of the poller running forever in the background, silently
+// multiplying ingestion again.
+export async function stopReader(client) {
+  if (!client) return;
+  for (const t of client._readerTimers || []) clearInterval(t);
+  await client.destroy().catch(() => {});
+}
+
+const POLL_INTERVAL_MS = Math.max(1, Number(process.env.CHANNEL_POLL_MINUTES ?? '3')) * 60_000;
+const POLL_FETCH_LIMIT = 20; // generous headroom vs. "posts several times an hour"
+
+// Reliable fallback for channels that don't push live updates to this
+// account (see the comment where this is called). Tracks each channel's
+// highest-seen message id in memory and only runs onUrl() for messages
+// newer than that — a channel that *does* also deliver live push just sees
+// its own messages skipped here as already-newer-than-lastSeenId, so this
+// never double-processes on its own; ingest()'s dedupe is still what
+// guards against overlap with the live handler seeing the same message
+// first. The very first pass per channel only records a baseline and
+// processes nothing, since backfill (if enabled) already owns catching up
+// on history — the poller's job is strictly "what showed up after boot".
+function pollChannels(client, sources, onUrl) {
+  const lastSeenId = new Map();
+
+  async function pollOnce() {
+    for (const channel of sources) {
+      let messages;
+      try {
+        messages = await client.getMessages(channel, { limit: POLL_FETCH_LIMIT });
+      } catch (e) {
+        console.error(`   reader: poll couldn't read ${channel} — ${e.message}`);
+        continue;
+      }
+      if (!messages.length) continue;
+      const maxId = Math.max(...messages.map((m) => m.id));
+
+      const since = lastSeenId.get(channel);
+      if (since == null) {
+        lastSeenId.set(channel, maxId);
+        continue;
+      }
+      if (maxId <= since) continue;
+
+      const fresh = messages.filter((m) => m.id > since).sort((a, b) => a.id - b.id);
+      for (const msg of fresh) {
+        const text = msg?.message;
+        if (!text) continue;
+        for (const url of extractUrls(text)) {
+          try {
+            await onUrl(url, text);
+          } catch (e) {
+            console.error('reader: poll ingest error:', e.message);
+          }
+        }
+      }
+      lastSeenId.set(channel, maxId);
+    }
+  }
+
+  pollOnce().catch((e) => console.error('reader: initial poll error:', e.message));
+  return setInterval(() => {
+    pollOnce().catch((e) => console.error('reader: poll error:', e.message));
+  }, POLL_INTERVAL_MS);
 }
 
 // One-time catch-up on startup: pull each source channel's last N messages
