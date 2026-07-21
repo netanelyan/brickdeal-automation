@@ -5,6 +5,7 @@ import { Telegraf, Markup } from 'telegraf';
 import { extractUrls, resolveToProductId } from './src/resolve.js';
 import { toCandidate, hasAliKeys } from './src/candidate.js';
 import * as store from './src/store.js';
+import { recordDeal } from './src/deals.js';
 import { readerConfigured, startReader, stopReader, sourceChannels } from './src/reader.js';
 import * as notify from './src/notify.js';
 
@@ -420,6 +421,18 @@ async function publishNext() {
   if (!cand) return false;
   await deliver(CHANNEL_ID, cand.message, cand.image);
   store.markSeen(cand.productId);
+
+  // Website feed. Deliberately after markSeen and deliberately non-fatal: the
+  // deal is already in the channel by this point, so a feed failure must not
+  // propagate and must not re-queue or re-post anything. Worst case the record
+  // is missing until scripts/rebuild-deals.js next runs.
+  try {
+    const { created, total } = recordDeal(cand);
+    console.log(`   deals.json: ${created ? 'added' : 'updated'} ${cand.productId} (${total} total)`);
+  } catch (e) {
+    console.error(`   deals.json: FAILED for ${cand.productId} — ${e.message}`);
+  }
+
   return true;
 }
 

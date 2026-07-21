@@ -81,12 +81,33 @@ function parseProduct(resp) {
     discountPct = Math.round((1 - Number(sale) / Number(orig)) * 100).toString();
   }
 
+  // Currency-verified pair, for anything that publishes a price claim outside
+  // Telegram (src/deals.js -> the website's deals.json).
+  //
+  // `salePrice`/`originalPrice` above fall back to `sale_price`/`original_price`,
+  // which a live response shows are quoted in CNY while the target_* pair is in
+  // ILS — a verified example returned target 54.35/67.94 ILS alongside
+  // 117.83/147.29 CNY. If target_original_price were ever absent, that fallback
+  // would pair a CNY "original" with an ILS sale price and manufacture a ~63%
+  // discount out of an exchange rate. Struck-through prices on the site are a
+  // price claim, so these fields are taken ONLY from target_* and only when the
+  // response states the currency it promised. Absent beats wrong.
+  const wantCurrency = (process.env.TARGET_CURRENCY || 'ILS').toUpperCase();
+  const okCurrency = (c) => String(c || '').toUpperCase() === wantCurrency;
+
+  const targetPrice = okCurrency(p.target_sale_price_currency) ? num(p.target_sale_price) : null;
+  const targetOriginalPrice =
+    okCurrency(p.target_original_price_currency) ? num(p.target_original_price) : null;
+
   return {
     id: p.product_id,
     title: p.product_title,
     salePrice: sale,
     originalPrice: orig,
     discountPct,
+    targetPrice,
+    targetOriginalPrice,
+    targetCurrency: targetPrice === null ? null : wantCurrency,
     image: pickImage(p),
     commissionRate: p.commission_rate ?? p.hot_product_commission_rate,
     promotionLink: p.promotion_link,

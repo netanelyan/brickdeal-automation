@@ -29,6 +29,15 @@ export async function toCandidate(url, sourceText = '', resolved = null) {
       setId: r.product.setId || null,
       pieces: r.product.pieces || null,
       stars: r.product.stars || null,
+      // Carried purely so src/deals.js can build the website record after the
+      // deal posts. Nothing in staging/approval/dedupe/drip reads these — the
+      // Telegram message is still rendered from the engine product, upstream.
+      // Without them the name and price would exist only inside `message`, and
+      // the feed would have to re-parse its own output to recover them.
+      name: r.product.title || null,
+      targetPrice: r.product.targetPrice ?? null,
+      targetOriginalPrice: r.product.targetOriginalPrice ?? null,
+      targetCurrency: r.product.targetCurrency ?? null,
     };
   }
 
