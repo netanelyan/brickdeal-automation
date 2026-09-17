@@ -182,8 +182,11 @@ export async function urlToMessage(input, { client = makeClient(), debug = false
   if (!link) return { ok: false, reason: 'no_link', productId, product };
   if (link.length > 150) link = await shorten(link); // only fires on the fallback
 
-  // AI-polish the Hebrew name + pull set id / pieces (no-op without a key)
-  const p = await polish(product.title, product.setId);
+  // AI-polish the Hebrew name + pull set id / pieces (no-op without a key).
+  // The photo goes along with the title: the set id here is scraped out of
+  // seller text and is often wrong, so the picture is what keeps the name
+  // attached to the actual item.
+  const p = await polish(product.title, product.setId, product.image);
   if (p.title) product.title = p.title;
   if (p.setId) product.setId = p.setId;
   if (p.pieces) product.pieces = p.pieces;
