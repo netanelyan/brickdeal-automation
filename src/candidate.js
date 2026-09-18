@@ -25,6 +25,9 @@ export async function toCandidate(url, sourceText = '', resolved = null) {
       productId: r.productId,
       message: r.message,
       image: r.product.image || null,
+      // Set when `image` is the official set render — the seller photo it
+      // replaced, kept so the feed refresh knows which one to re-check.
+      sourceImage: r.product.sourceImage || null,
       link: r.link,
       setId: r.product.setId || null,
       pieces: r.product.pieces || null,

@@ -140,12 +140,14 @@ export function toRecord(cand, now = new Date()) {
   const pieces = num(cand.pieces);
   const stars = num(cand.stars ?? cand.rating);
   const image = str(cand.image ?? cand.imageUrl);
+  const sourceImage = str(cand.sourceImage);
   const theme = detectTheme(name);
 
   if (setId) rec.setId = setId;
   if (pieces !== undefined && pieces > 0) rec.pieces = Math.round(pieces);
   if (stars !== undefined && stars > 0) rec.stars = Math.round(stars * 10) / 10;
   if (image) rec.image = image;
+  if (sourceImage && sourceImage !== image) rec.sourceImage = sourceImage;
   if (theme) rec.theme = theme;
 
   return rec;

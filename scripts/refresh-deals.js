@@ -138,7 +138,10 @@ async function main() {
           missStrikes: undefined,
           dead: undefined,
         };
-        if (fresh.image) u.image = fresh.image;
+        // A record carrying sourceImage shows the official set render (see
+        // src/setImage.js); the seller photo lives on sourceImage, so that is
+        // what the fresh AliExpress image replaces — never the render.
+        if (fresh.image) u[d.sourceImage ? 'sourceImage' : 'image'] = fresh.image;
 
         /* originalPrice is a price claim, so it is only ever written from the
            currency-verified list price and only while genuinely above the sale

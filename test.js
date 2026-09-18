@@ -25,6 +25,7 @@ urlToMessage(input, { debug })
     }
     console.log('\n' + r.message + '\n');
     console.error(`OK id=${r.productId} commission=${r.product.commissionRate ?? '?'}% via=${r.resolvedFrom}`);
+    console.error(`image: ${r.product.image}${r.product.sourceImage ? ' (official render; seller photo: ' + r.product.sourceImage + ')' : ' (seller photo)'}`);
   })
   .catch((e) => {
     console.error('Error:', e.message);

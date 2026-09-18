@@ -2,6 +2,7 @@ import { AliClient } from './aliClient.js';
 import { resolveToProductId } from './resolve.js';
 import { formatMessage } from './format.js';
 import { polish } from './polish.js';
+import { officialImageFor } from './setImage.js';
 import { shorten } from './shorten.js';
 import { extractSetIdFromText, extractPiecesFromText } from './sourceText.js';
 
@@ -201,6 +202,16 @@ export async function urlToMessage(input, { client = makeClient(), debug = false
   if (!product.pieces) {
     const pieces = extractPiecesFromText(sourceText);
     if (pieces) product.pieces = pieces;
+  }
+
+  // Official render instead of the seller photo — only once the set number
+  // is final (title scrape, polish, source text) and only after the render is
+  // vision-checked against the seller photo. The seller photo is kept on
+  // `sourceImage` so a wrong swap can be traced back.
+  const official = await officialImageFor(product.setId, product.image, debug);
+  if (official) {
+    product.sourceImage = product.image;
+    product.image = official;
   }
 
   return {

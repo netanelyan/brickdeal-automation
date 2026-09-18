@@ -84,6 +84,7 @@ framework beyond the two libraries below.
 | `src/resolve.js` | Turns any AliExpress URL shape (or a bare ID) into a canonical product ID; pulls AliExpress URLs out of free-form message text. |
 | `src/format.js` | The Hebrew Telegram card template (title, set id, pieces, price, rating, link, brand/disclosure line). |
 | `src/polish.js` | Optional Claude-powered Hebrew title rewrite. No-ops silently without `ANTHROPIC_API_KEY`. |
+| `src/setImage.js` | Swaps the seller photo for the official set render (Brickset, then BrickLink) once the set number is final — only after a Claude vision check confirms the render shows the same model as the seller photo. `scripts/backfill-set-images.js` runs the same over the existing website feed. |
 | `src/sourceText.js` | Regex fallback that pulls a set number / piece count out of the surrounding channel message, for when AliExpress's own title doesn't have one. |
 | `src/shorten.js` | Last-resort URL shortener chain (v.gd → is.gd → tinyurl) for the rare affiliate link too long for a caption. |
 | `src/store.js` | The whole persistence layer — dedupe (TTL'd), publish queue, staging map, and pending-edit state — as one JSON file. |
@@ -132,6 +133,16 @@ from source channels instead of you forwarding links by hand:
 
 AI title polish is optional too — just set `ANTHROPIC_API_KEY`. Costs a
 tiny bit per candidate, and is skipped entirely without a key.
+
+With a key, the card's photo is also upgraded: when the set number checks out
+against Brickset/BrickLink *and* Claude agrees the official render shows the
+same model as the seller's photo, the render is used instead — the channel and
+the website get one consistent, clean product-shot style rather than whatever
+each seller uploaded. The seller photo is kept on the feed record as
+`sourceImage`, so the nightly refresh keeps re-checking the listing without
+undoing the swap. `OFFICIAL_IMAGES=false` turns it off; a one-off
+`node scripts/backfill-set-images.js` (`--dry` to preview) applies it to deals
+already on the site.
 
 ## Deployment (pm2)
 
@@ -207,8 +218,8 @@ Names only — see `.env.example` for the full file with inline comments.
 **Localisation** (passed straight to AliExpress's `productdetail.get`)
 `TARGET_CURRENCY`, `TARGET_LANGUAGE`, `TARGET_COUNTRY`
 
-**AI title polish (optional)**
-`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`
+**AI title polish + official set images (optional)**
+`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `OFFICIAL_IMAGES`
 
 **Auto-reader (optional)**
 `TG_API_ID`, `TG_API_HASH`, `TG_SESSION`, `SOURCE_CHANNELS`, `BACKFILL_COUNT`, `CHANNEL_POLL_MINUTES`, `READER_VERBOSE`
